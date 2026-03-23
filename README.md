@@ -1,7 +1,7 @@
 # Shortcuterie
 
 A Windows shortcut (.lnk) creation tool that can embeds custom icons directly inside shortcut files using **NTFS Alternate Data Streams**.
-> **How does it work?** See the [Documentation](Documentation.md) of the ADS injection mechanism, ICO construction, PE resource extraction...
+> **How does it work?** See the [Documentation](Documentation.md)
 
 ![Windows 7](https://img.shields.io/badge/Windows-7%2B-blue?logo=windows)
 ![PowerShell 2.0](https://img.shields.io/badge/PowerShell-2.0%2B-blue?logo=powershell)
