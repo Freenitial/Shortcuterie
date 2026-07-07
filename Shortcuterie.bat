@@ -67,7 +67,7 @@
 #region ── VERSION & PATHS ─
 
 $script:AppName       = "Shortcuterie"
-$script:Version       = [version]"1.0"
+$script:Version       = [version]"1.1"
 
 # ---- Remaining functions for Invoke-LoadingPump + updates ----
 $t=$d.DefineType('E','Public,Class')
@@ -165,6 +165,7 @@ public static class DPIHelper {
     }
 }
 $script:DPI_Factor = Get-DisplayPrimaryScaling
+$script:StartupDpiFactor = $script:DPI_Factor
 write-host "DPI = $script:DPI_Factor"
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -332,6 +333,7 @@ public static class IcoBuilder
             if (count > 0 && hIcons[0] != IntPtr.Zero)
             {
                 Icon ico = Icon.FromHandle(hIcons[0]);
+                bool stop = false;
                 try
                 {
                     Bitmap trueColor = ico.ToBitmap();
@@ -348,10 +350,13 @@ public static class IcoBuilder
                             }
                             finally { g.Dispose(); }
                             // Stop if we get upscaled duplicates (bitmap smaller than requested)
-                            if (bmp.Width < sz && entrySizes.Count > 0) break;
-                            MemoryStream ms = new MemoryStream();
-                            try { bmp.Save(ms, ImageFormat.Png); pngEntries.Add(ms.ToArray()); entrySizes.Add(sz); }
-                            finally { ms.Dispose(); }
+                            if (bmp.Width < sz && entrySizes.Count > 0) { stop = true; }
+                            else
+                            {
+                                MemoryStream ms = new MemoryStream();
+                                try { bmp.Save(ms, ImageFormat.Png); pngEntries.Add(ms.ToArray()); entrySizes.Add(sz); }
+                                finally { ms.Dispose(); }
+                            }
                         }
                         finally { bmp.Dispose(); }
                     }
@@ -359,6 +364,7 @@ public static class IcoBuilder
                 }
                 finally { ico.Dispose(); }
                 DestroyIcon(hIcons[0]);
+                if (stop) break;
             }
         }
         if (pngEntries.Count == 0) return null;
@@ -387,7 +393,8 @@ public static class IcoBuilder
         if (count > 0 && hIcons[0] != IntPtr.Zero)
         {
             Icon ico = Icon.FromHandle(hIcons[0]);
-            Bitmap bmp = new Bitmap(ico.ToBitmap());
+            Bitmap bmp;
+            using (Bitmap tmp = ico.ToBitmap()) { bmp = new Bitmap(tmp); }
             ico.Dispose();
             DestroyIcon(hIcons[0]);
             return bmp;
@@ -863,8 +870,10 @@ $script:AumidCleanRegex = New-Object System.Text.RegularExpressions.Regex('[^a-z
 $script:AumidLeadDotRegex = New-Object System.Text.RegularExpressions.Regex('^\.+', [System.Text.RegularExpressions.RegexOptions]::Compiled)
 
 $script:LastIconMenuPath  = ""
+$script:BuiltIconMenuPath = $null
 $script:ShellTargetIconCache = $null
 $script:LastPinnedTaskbarFile = ""
+$script:LastPinnedConfigKey   = ""     # target|lnk snapshot from the last taskbar pin
 
 # Shortcut limits (MS-SHLLINK spec)
 $script:MaxTargetPath        = 260
@@ -879,6 +888,7 @@ $script:CurrentPreviewBitmap = $null
 $script:ActiveDropZone       = $null
 $script:SuppressAutoFill     = $false
 $script:PreviousTargetText   = ""
+$script:DeclinedSplitText    = $null
 $script:SuppressTargetSplit  = $false
 $script:ArgsFromAutoSplit    = $false
 $script:ShellTargetRegexOpts = [System.Text.RegularExpressions.RegexOptions]::Compiled -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
@@ -918,6 +928,10 @@ public delegate void WndProcEventHandler(object sender, Message m);
 public class CustomForm : Form
 {
     public event WndProcEventHandler OnWindowMessage;
+    public event Action<float> DpiScaleChanged;
+    private const int WM_DPICHANGED = 0x02E0;
+    private const int WM_DROPFILES  = 0x0233;
+    private const int WM_SETTINGCHANGE = 0x001A;
     public CustomForm()
     {
         SetStyle(
@@ -928,8 +942,101 @@ public class CustomForm : Form
     }
     protected override void WndProc(ref Message m)
     {
+        if (m.Msg == WM_DPICHANGED)
+        {
+            int newDpi = m.WParam.ToInt32() & 0xFFFF;
+            if (newDpi <= 0) newDpi = 96;
+            float newScale = (float)newDpi / 96.0f;
+            if (DpiScaleChanged != null) DpiScaleChanged(newScale);
+            m.Result = IntPtr.Zero;
+            return;
+        }
         base.WndProc(ref m);
-        if (OnWindowMessage != null) OnWindowMessage(this, m);
+        if (OnWindowMessage != null && (m.Msg == WM_DROPFILES || m.Msg == WM_SETTINGCHANGE))
+            OnWindowMessage(this, m);
+    }
+}
+
+// A radio button that OWNER-DRAWS its glyph at a size derived from the (live-
+// scaled) font, so it re-renders crisply on a runtime DPI change. A standard
+// RadioButton sizes its glyph from the frozen DeviceDpi, so Control.Scale leaves
+// it stuck at the startup size (big + pixelated after a live down-scale).
+public class ScalingRadioButton : RadioButton
+{
+    public ScalingRadioButton()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
+        AutoSize = false;
+        UpdateStyles();
+    }
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        Color bg = BackColor;
+        if (bg.A < 255 && Parent != null) bg = Parent.BackColor;
+        g.Clear(bg);
+        Color fg = Enabled ? ForeColor : Color.FromArgb(120, 120, 120);
+        float fh = Font.GetHeight(g);
+        int d = (int)Math.Round(fh);
+        if (d < 8) d = 8;
+        int gy = (Height - d) / 2;
+        float pw = Math.Max(1f, d / 11f);
+        float cs = d - 2f;                    // circle diameter
+        float cx = 1f + cs / 2f;              // circle centre (for a concentric dot)
+        float cy = gy + 1f + cs / 2f;
+        using (Pen pen = new Pen(fg, pw)) g.DrawEllipse(pen, 1f, gy + 1f, cs, cs);
+        if (Checked)
+        {
+            float inner = cs * 0.45f;
+            Color dot = Enabled ? Color.FromArgb(0, 120, 212) : Color.FromArgb(110, 110, 110);
+            using (SolidBrush br = new SolidBrush(dot)) g.FillEllipse(br, cx - inner / 2f, cy - inner / 2f, inner, inner);
+        }
+        int tx = d + (int)(d * 0.18f);
+        Rectangle tr = new Rectangle(tx, 0, Width - tx, Height);
+        TextRenderer.DrawText(g, Text, Font, tr, fg, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+    }
+}
+
+// Same idea as ScalingRadioButton, for CheckBox : the box + checkmark scale with
+// the font so they re-render crisply on a live DPI change (a standard CheckBox
+// glyph is frozen at the startup DeviceDpi under the PS host).
+public class ScalingCheckBox : CheckBox
+{
+    public ScalingCheckBox()
+    {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
+        AutoSize = false;
+        UpdateStyles();
+    }
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        Graphics g = e.Graphics;
+        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+        Color bg = BackColor;
+        if (bg.A < 255 && Parent != null) bg = Parent.BackColor;
+        g.Clear(bg);
+        Color fg = Enabled ? ForeColor : Color.FromArgb(120, 120, 120);
+        float fh = Font.GetHeight(g);
+        int d = (int)Math.Round(fh);
+        if (d < 8) d = 8;
+        int gy = (Height - d) / 2;
+        float bs = d - 2f;
+        float pw = Math.Max(1.2f, d / 9f);
+        using (Pen pen = new Pen(fg, pw)) g.DrawRectangle(pen, 1f, gy + 1f, bs, bs);
+        if (Checked)
+        {
+            using (Pen cp = new Pen(fg, Math.Max(1.5f, d / 6f)))
+            {
+                cp.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                cp.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                g.DrawLine(cp, 1f + bs * 0.22f, gy + 1f + bs * 0.52f, 1f + bs * 0.42f, gy + 1f + bs * 0.72f);
+                g.DrawLine(cp, 1f + bs * 0.42f, gy + 1f + bs * 0.72f, 1f + bs * 0.80f, gy + 1f + bs * 0.26f);
+            }
+        }
+        int tx = d + (int)(d * 0.18f);
+        Rectangle tr = new Rectangle(tx, 0, Width - tx, Height);
+        TextRenderer.DrawText(g, Text, Font, tr, fg, TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
     }
 }
 
@@ -987,10 +1094,19 @@ public static class DarkMode
 {
     [DllImport("uxtheme.dll", EntryPoint = "#135", SetLastError = true)]
     private static extern int SetPreferredAppMode(int mode);
+    [DllImport("uxtheme.dll", EntryPoint = "#133", SetLastError = true)]
+    private static extern bool AllowDarkModeForWindow(IntPtr hwnd, bool allow);
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
     public static void Init() { try { SetPreferredAppMode(1); } catch { } }
+    // Force the process app mode to match Shortcuterie's OWN dark/light toggle
+    // (2 = ForceDark, 3 = ForceLight) so themed scrollbars don't just follow the
+    // system theme (AllowDark) and end up light while the app is dark.
+    public static void SetAppMode(bool dark) { try { SetPreferredAppMode(dark ? 2 : 3); } catch { } }
     public static void ApplyControl(IntPtr hwnd, bool dark) {
+        // AllowDarkModeForWindow is REQUIRED for a ListView (SysListView32) to
+        // honour the dark scrollbar theme ; a plain Panel works without it.
+        try { AllowDarkModeForWindow(hwnd, dark); } catch { }
         NativeMethods.SetWindowTheme(hwnd, dark ? "DarkMode_Explorer" : "Explorer", null);
     }
     public static void ApplyWindowFrame(IntPtr hwnd, bool dark) {
@@ -1354,7 +1470,8 @@ public static class IconResolver
                 if (hIcon != IntPtr.Zero)
                 {
                     Icon ico = Icon.FromHandle(hIcon);
-                    Bitmap bmp = new Bitmap(ico.ToBitmap());
+                    Bitmap bmp;
+                    using (Bitmap tmp = ico.ToBitmap()) { bmp = new Bitmap(tmp); }
                     ico.Dispose();
                     DestroyIcon(hIcon);
                     if (bmp.Width >= 32)
@@ -1373,7 +1490,9 @@ public static class IconResolver
             (uint)Marshal.SizeOf(typeof(SHFILEINFO)), SHGFI_ICON | SHGFI_LARGEICON);
         if (result != IntPtr.Zero && shfi.hIcon != IntPtr.Zero)
         {
-            Bitmap bmp = Icon.FromHandle(shfi.hIcon).ToBitmap();
+            Icon ico = Icon.FromHandle(shfi.hIcon);
+            Bitmap bmp = ico.ToBitmap();
+            ico.Dispose();
             DestroyIcon(shfi.hIcon);
             _lastDiagnostic = "ExtractShellIcon : " + bmp.Width + "x" + bmp.Height + " from SHGFI_ICON fallback";
             return bmp;
@@ -1629,8 +1748,12 @@ public static class TaskbarPinHelper
     private static extern IntPtr ILFindLastID(IntPtr pidl);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
-    [DllImport("shell32.dll")]
-    private static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindowEx(IntPtr hwndParent, IntPtr hwndChildAfter, string lpszClass, string lpszWindow);
+    [DllImport("user32.dll")]
+    private static extern IntPtr PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr CreateMutexExW(IntPtr lpMutexAttributes, string lpName, uint dwFlags, uint dwDesiredAccess);
     [DllImport("kernel32.dll", SetLastError = true)]
@@ -1739,11 +1862,13 @@ public static class TaskbarPinHelper
 
     public static void SendPinNotify()
     {
-        byte[] payload = new byte[12];
-        payload[0] = 0x0A; payload[1] = 0x00; payload[2] = 0x0D; payload[3] = 0x00;
-        IntPtr ptr = Marshal.AllocHGlobal(12);
-        try { Marshal.Copy(payload, 0, ptr, 12); SHChangeNotify(0x04000000, 0x3000, ptr, IntPtr.Zero); }
-        finally { Marshal.FreeHGlobal(ptr); }
+        IntPtr tray = FindWindow("Shell_TrayWnd", null);
+        if (tray == IntPtr.Zero) return;
+        IntPtr rebar = FindWindowEx(tray, IntPtr.Zero, "ReBarWindow32", null);
+        if (rebar == IntPtr.Zero) return;
+        IntPtr band = FindWindowEx(rebar, IntPtr.Zero, "MSTaskSwWClass", null);
+        if (band == IntPtr.Zero) return;
+        PostMessage(band, 0x446, IntPtr.Zero, IntPtr.Zero);
     }
 
     private static IntPtr _mutexHandle = IntPtr.Zero;
@@ -2087,6 +2212,16 @@ $script:CreateBtnDebounceTimer.Add_Tick({
     $this.Stop()
     Update-CreateButtonState
 })
+
+# Debounce timer for Base64 icon preview (avoids decoding on every keystroke)
+$script:Base64DebounceTimer = New-Object System.Windows.Forms.Timer
+$script:Base64DebounceTimer.Interval = 300
+$script:Base64DebounceTimer.Add_Tick({
+    $this.Stop()
+    if ($script:SuppressPreviewUpdate) { return }
+    Update-IconPreview
+    Update-NtfsWarning
+})
 $script:CreateBtnFlashTimer = $null
 function Reset-CreateButtonFlash {
     if ($null -ne $script:CreateBtnFlashTimer) {
@@ -2429,7 +2564,7 @@ function New-ShortcutFromFields {
     else {
         $arguments = $textArgs.Text.Trim()
         $workDir   = Get-CleanInput $textWorkDir.Text
-        if (Test-StringEmpty $workDir -and (-not (Test-StringEmpty $targetPath)) -and [IO.File]::Exists($targetPath)) {
+        if ((Test-StringEmpty $workDir) -and (-not (Test-StringEmpty $targetPath)) -and [IO.File]::Exists($targetPath)) {
             $workDir = [IO.Path]::GetDirectoryName($targetPath)
         }
         switch ($iconMode) {
@@ -2467,9 +2602,9 @@ function Invoke-TaskbarPin {
     # Resolve beef001d content (display name for the blob entry)
     $beef001d = $null
     foreach ($beef001dResolver in @(
+        { [ShortcutHelper]::GetAppUserModelId($LnkPath) },
         { [ShortcutHelper]::GetTargetPath($LnkPath) },
         { [ShortcutHelper]::GetParsedDisplayName($LnkPath) },
-        { [ShortcutHelper]::GetAppUserModelId($LnkPath) },
         { [IO.Path]::GetFileNameWithoutExtension($LnkPath) }
     )) {
         try { $beef001d = & $beef001dResolver } catch {}
@@ -2496,6 +2631,7 @@ function Invoke-TaskbarPin {
         return $false
     }
     $script:LastPinnedTaskbarFile = [IO.Path]::GetFileName($destLnk)
+    $script:LastPinnedConfigKey   = (Get-CleanInput $textTarget.Text) + '|' + (Get-CleanInput $textLnkPath.Text)
     # Repoint ADS IconLocation to the copied file path, then re-embed ADS (Save wipes it)
     try {
         $currentIconPath = [ShortcutHelper]::GetIconPath($destLnk)
@@ -2521,6 +2657,7 @@ function Invoke-TaskbarPin {
     }
     # Inject into registry Favorites blob
     $mutexAcquired = [TaskbarPinHelper]::AcquirePinMutex(5000)
+    if (-not $mutexAcquired) { Write-Log 'Pin mutex timeout' -Level Error; return $false }
     try {
         $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regSubKey, $true)
         if (-not $key) {
@@ -2570,6 +2707,7 @@ function Invoke-TaskbarPin {
 function Update-IconPreview {
     if ($script:SuppressPreviewUpdate) { return }
     Set-ControlRedraw $btnIconPreview $false
+    try {
     $newBmp = $null
     if ($radioIcon_TargetDefault.Checked) {
         $targetPath = Get-CleanInput $textTarget.Text
@@ -2686,29 +2824,33 @@ function Update-IconPreview {
         $btnIconPreview.FlatAppearance.MouseOverBackColor = $btnIconPreview.BackColor
         $btnIconPreview.FlatAppearance.MouseDownBackColor = $btnIconPreview.BackColor
     }
-    Set-ControlRedraw $btnIconPreview $true
+    }
+    finally {
+        Set-ControlRedraw $btnIconPreview $true
+    }
     Update-CreateButtonState
 }
 
-# ── Populate icon index dropdown menu from an executable file ──
-function Update-IconIndexMenu {
-    # Dispose old menu item images
+# ── Dispose the icon index menu items and their images ──
+function Clear-IconIndexMenuItems {
     $script:IconIndexMenu.SuspendLayout()
     foreach ($item in $script:IconIndexMenu.Items) {
         if ($item.Image) { $item.Image.Dispose(); $item.Image = $null }
     }
     $script:IconIndexMenu.Items.Clear()
     $script:IconIndexMenu.ResumeLayout()
+    $script:BuiltIconMenuPath = $null
+}
+
+# ── Refresh the icon index count for the current icon file (no item build) ──
+function Update-IconIndexMenu {
+    Clear-IconIndexMenuItems
     $script:CurrentExeIconCount = 0
     if ($radioIcon_TargetDefault.Checked -or $radioIcon_Base64.Checked) { $btnIconPreview.Invalidate(); return }
     # Negative resource IDs are a specific icon reference, not a browsable index
     if ($script:CurrentIconIndex -lt 0) { $btnIconPreview.Invalidate(); return }
     $filePath = Get-CleanInput $iconPathTextbox.Text
     if (Test-StringEmpty $filePath) { $script:LastIconMenuPath = ""; $btnIconPreview.Invalidate(); return }
-    # Skip rebuild if same file (avoid repeated PE extraction while user types)
-    if ($filePath -eq $script:LastIconMenuPath -and $script:CurrentExeIconCount -gt 0) {
-        $btnIconPreview.Invalidate(); return
-    }
     $script:LastIconMenuPath = $filePath
     if (-not [IO.File]::Exists($filePath)) { $btnIconPreview.Invalidate(); return }
     $ext = [IO.Path]::GetExtension($filePath).ToLower()
@@ -2716,7 +2858,19 @@ function Update-IconIndexMenu {
     $iconCount = [IcoBuilder]::GetIconCount($filePath)
     $script:CurrentExeIconCount = $iconCount
     Write-Log "Icon index menu : $iconCount icons in $filePath" -Level Debug
-    if ($iconCount -le 1) { $btnIconPreview.Invalidate(); return }
+    $btnIconPreview.Invalidate()
+}
+
+# ── Build the icon index dropdown items lazily (only when the menu is shown) ──
+function Build-IconIndexMenuItems {
+    $filePath = Get-CleanInput $iconPathTextbox.Text
+    if (Test-StringEmpty $filePath) { return }
+    if ($filePath -eq $script:BuiltIconMenuPath -and $script:IconIndexMenu.Items.Count -gt 0) { return }
+    Clear-IconIndexMenuItems
+    if (-not [IO.File]::Exists($filePath)) { return }
+    $iconCount = $script:CurrentExeIconCount
+    if ($iconCount -le 1) { return }
+    $script:IconIndexMenu.SuspendLayout()
     for ($idx = 0; $idx -lt $iconCount; $idx++) {
         $bmp = [IcoBuilder]::ExtractBitmapAtSize($filePath, $idx, 32)
         if ($null -eq $bmp) { continue }
@@ -2737,7 +2891,8 @@ function Update-IconIndexMenu {
         })
         [void]$script:IconIndexMenu.Items.Add($menuItem)
     }
-    $btnIconPreview.Invalidate()
+    $script:IconIndexMenu.ResumeLayout()
+    $script:BuiltIconMenuPath = $filePath
 }
 
 # ── Update arguments length indicator with color coding and Explorer warning ──
@@ -2823,12 +2978,21 @@ function Update-PinButtonState {
     if ($btnPin.Enabled) {
         # Check if the shortcut is already pinned (by filename, always .lnk in taskbar)
         $taskBarDir = [IO.Path]::Combine($env:APPDATA, 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar')
-        $lnkPath = Get-CleanInput $textLnkPath.Text
-        $fileName = if (-not (Test-StringEmpty $lnkPath)) { [IO.Path]::ChangeExtension([IO.Path]::GetFileName($lnkPath), '.lnk') }
-                    else { [IO.Path]::GetFileNameWithoutExtension((Get-CleanInput $textTarget.Text)) + '.lnk' }
-        $pinnedPath = [IO.Path]::Combine($taskBarDir, $fileName)
-        $alreadyPinned = [IO.File]::Exists($pinnedPath)
-        if (-not $alreadyPinned -and -not (Test-StringEmpty $script:LastPinnedTaskbarFile)) {
+        $alreadyPinned = $false
+        try {
+            $lnkPath = Get-CleanInput $textLnkPath.Text
+            $fileName = if (-not (Test-StringEmpty $lnkPath)) { [IO.Path]::ChangeExtension([IO.Path]::GetFileName($lnkPath), '.lnk') }
+                        else { [IO.Path]::GetFileNameWithoutExtension((Get-CleanInput $textTarget.Text)) + '.lnk' }
+            $pinnedPath = [IO.Path]::Combine($taskBarDir, $fileName)
+            $alreadyPinned = [IO.File]::Exists($pinnedPath)
+        }
+        catch { $alreadyPinned = $false }
+        # Fallback for pins whose taskbar filename differs from the derived name
+        # (e.g. a .cpl pinned under its resolved applet name) : trust it ONLY while
+        # the current Target/name still match what was pinned, so editing the target
+        # correctly drops the "Pinned" state instead of leaving it stuck.
+        if (-not $alreadyPinned -and -not (Test-StringEmpty $script:LastPinnedTaskbarFile) -and
+            ($script:LastPinnedConfigKey -eq ((Get-CleanInput $textTarget.Text) + '|' + (Get-CleanInput $textLnkPath.Text)))) {
             $alreadyPinned = [IO.File]::Exists([IO.Path]::Combine($taskBarDir, $script:LastPinnedTaskbarFile))
         }
         $btnPin.Text = if ($alreadyPinned) { [char]0x2714 + " Pinned" } else { "Pin to Taskbar" }
@@ -2911,7 +3075,7 @@ function New-UrlShortcut {
         $lines.Add("IconFile=$IconFile")
         $lines.Add("IconIndex=$IconIndex")
     }
-    [IO.File]::WriteAllLines($FilePath, $lines.ToArray())
+    [IO.File]::WriteAllLines($FilePath, $lines.ToArray(), [System.Text.Encoding]::Default)
     Write-Log "URL shortcut created : $FilePath -> $Url" -Level Debug
 }
 
@@ -2983,7 +3147,7 @@ function Import-ExistingShortcut {
         if ($importExt -eq '.url') {
             # ── .url internet shortcut (INI format) ──
             $urlValue = ""; $iconFilePath = ""; $iconFileIndex = 0
-            foreach ($line in [IO.File]::ReadAllLines($LnkPath)) {
+            foreach ($line in [IO.File]::ReadAllLines($LnkPath, [System.Text.Encoding]::Default)) {
                 $trimmed = $line.Trim()
                 if     ($trimmed.StartsWith('URL=',       [System.StringComparison]::OrdinalIgnoreCase)) { $urlValue     = $trimmed.Substring(4).Trim() }
                 elseif ($trimmed.StartsWith('IconFile=',  [System.StringComparison]::OrdinalIgnoreCase)) { $iconFilePath = $trimmed.Substring(9).Trim() }
@@ -3158,7 +3322,7 @@ function Import-ExistingShortcut {
 # ── Apply a resolved icon path+index to the left panel (returns $true on success) ──
 function Set-ResolvedIconSource {
     param([string]$Path, [int]$Index = 0, [string]$Source = '')
-    if (Test-StringEmpty $Path -or -not [IO.File]::Exists($Path)) {
+    if ((Test-StringEmpty $Path) -or (-not [IO.File]::Exists($Path))) {
         if (-not (Test-StringEmpty $Source)) { Write-Log "  [$Source] no result" -Level Debug }
         return $false
     }
@@ -3300,7 +3464,7 @@ function Resolve-FileIcon {
         Write-Log "Resolving icon for .url : $FilePath" -Level Debug
         try {
             $iconFilePath = $null; $iconFileIndex = 0
-            foreach ($line in [IO.File]::ReadAllLines($FilePath)) {
+            foreach ($line in [IO.File]::ReadAllLines($FilePath, [System.Text.Encoding]::Default)) {
                 $trimmed = $line.Trim()
                 if     ($trimmed.StartsWith('IconFile=',  [System.StringComparison]::OrdinalIgnoreCase)) { $iconFilePath  = $trimmed.Substring(9).Trim() }
                 elseif ($trimmed.StartsWith('IconIndex=', [System.StringComparison]::OrdinalIgnoreCase)) { [int]::TryParse($trimmed.Substring(10).Trim(), [ref]$iconFileIndex) | Out-Null }
@@ -3466,7 +3630,8 @@ function Split-TargetAndArguments {
             $candidatePath = $raw.Substring(0, $splitPos)
             # Strip surrounding quotes without allocating a Trim char array
             if ($candidatePath.Length -gt 1 -and ($candidatePath[0] -eq '"' -or $candidatePath[0] -eq "'")) {
-                $candidatePath = $candidatePath.Substring(1, $candidatePath.Length - (if ($candidatePath[$candidatePath.Length - 1] -eq $candidatePath[0]) { 2 } else { 1 }))
+                $trim = if ($candidatePath[$candidatePath.Length - 1] -eq $candidatePath[0]) { 2 } else { 1 }
+                $candidatePath = $candidatePath.Substring(1, $candidatePath.Length - $trim)
             }
             if ([IO.File]::Exists($candidatePath)) {
                 $remainder = if ($splitPos -lt $raw.Length) { $raw.Substring($splitPos).TrimStart() } else { '' }
@@ -3516,6 +3681,7 @@ function Split-TargetAndArguments {
 # ── Apply target/arguments split to the textboxes ──
 function Invoke-TargetSplit {
     param([string]$Text)
+    if ($Text -eq $script:DeclinedSplitText) { return }
     $parsed = Split-TargetAndArguments $Text
     if (Test-StringEmpty $parsed.Arguments) { return }
     $existingArgs = $textArgs.Text
@@ -3529,6 +3695,7 @@ function Invoke-TargetSplit {
             [System.Windows.Forms.MessageBoxIcon]::Question)
         if ($result -ne [System.Windows.Forms.DialogResult]::Yes) {
             Write-Log "User declined auto-split argument replacement" -Level Debug
+            $script:DeclinedSplitText = $Text
             return
         }
     }
@@ -3550,6 +3717,7 @@ function Invoke-ZoneDrop {
     $form.UseWaitCursor = $true
     $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
     [System.Windows.Forms.Application]::DoEvents()
+    try {
     if (Test-StringEmpty $Zone) { return }
     Write-Log "Drop received : '$FilePath' on zone '$Zone'"
     $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
@@ -3609,7 +3777,7 @@ function Invoke-ZoneDrop {
             }
             elseif ($ext -eq '.url') {
                 try {
-                    foreach ($line in [IO.File]::ReadAllLines($FilePath)) {
+                    foreach ($line in [IO.File]::ReadAllLines($FilePath, [System.Text.Encoding]::Default)) {
                         $trimmed = $line.Trim()
                         if ($trimmed.StartsWith('URL=', [System.StringComparison]::OrdinalIgnoreCase)) {
                             $textTarget.Text = $trimmed.Substring(4).Trim()
@@ -3633,6 +3801,11 @@ function Invoke-ZoneDrop {
                             Update-IconPreview
                         }
                     }
+                }
+                elseif ($ext -eq '.msc') {
+                    # .msc icons aren't usable via Any File (they render as invalid) :
+                    # always fall back to the Target icon source.
+                    $radioIcon_TargetDefault.Checked = $true
                 }
                 elseif (Test-IconSourceEmpty) {
                     $radioIcon_TargetDefault.Checked = $true
@@ -3696,8 +3869,11 @@ function Invoke-ZoneDrop {
             }
         }
     }
-    $form.UseWaitCursor = $false
-    $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
+    finally {
+        $form.UseWaitCursor = $false
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    }
 }
 
 # ── Write ICO bytes to an NTFS Alternate Data Stream ──
@@ -3716,6 +3892,7 @@ function Get-AdsIconLength {
 # ── Recursive dark scrollbar applicator ──
 function Set-DarkScrollbars {
     param([System.Windows.Forms.Control]$Root, [bool]$Dark)
+    [DarkMode]::SetAppMode($Dark)
     $types = @('TextBox','RichTextBox','FlowLayoutPanel','Panel','CheckedListBox')
     $queue = New-Object System.Collections.Queue
     $queue.Enqueue($Root)
@@ -3819,7 +3996,7 @@ $btnClose.Add_Click({ $form.Close() })
 $titleBar.Controls.AddRange(@($iconBox, $titleLabel))
 
 # Console toggle (explicit font : leaf control)
-$chkConsole = gen $titleBar "CheckBox" "Show console" 0 ([int](($titleBarHeight-18)/2)) 101 18 "Font=Arial, 8" "BackColor=240 240 240" "FlatStyle=Flat" "Anchor=Top,Right"
+$chkConsole = gen $titleBar "ScalingCheckBox" "Show console" 0 ([int](($titleBarHeight-18)/2)) 101 18 "Font=Arial, 8" "BackColor=240 240 240" "FlatStyle=Flat" "Anchor=Top,Right"
 $chkConsole.Location = New-Object System.Drawing.Point(($btnMinimize.Left - $chkConsole.Width - 8), $chkConsole.Location.Y)
 $chkConsole.Add_CheckedChanged({
     $h = [NativeMethods]::GetConsoleWindow()
@@ -3831,7 +4008,7 @@ $chkConsole.Add_CheckedChanged({
 $chkConsole.BringToFront()
 
 # Dark mode toggle (explicit font : leaf control)
-$chkDarkMode = gen $titleBar "CheckBox" "Dark mode" 0 ([int](($titleBarHeight-18)/2)) 85 18 "Font=Arial, 8" "BackColor=240 240 240" "FlatStyle=Flat" "Anchor=Top,Right"
+$chkDarkMode = gen $titleBar "ScalingCheckBox" "Dark mode" 0 ([int](($titleBarHeight-18)/2)) 85 18 "Font=Arial, 8" "BackColor=240 240 240" "FlatStyle=Flat" "Anchor=Top,Right"
 $chkDarkMode.Location = New-Object System.Drawing.Point(($chkConsole.Left - $chkDarkMode.Width - 4), $chkDarkMode.Location.Y)
 $chkDarkMode.BringToFront()
 
@@ -3863,8 +4040,10 @@ $btnReset.Add_Click({
         $script:CurrentIconIndex    = 0
         $script:CurrentExeIconCount = 0
         $script:LastIconMenuPath    = ""
+        $script:BuiltIconMenuPath   = $null
         $script:ArgsFromAutoSplit    = $false
         $script:PreviousTargetText   = ""
+        $script:DeclinedSplitText    = $null
         $script:LastPinnedTaskbarFile = ""
         # Reset special modes
         $script:IsShellTarget = $true
@@ -3924,7 +4103,9 @@ $btnAbout.Add_Paint({
         $borderPen.Dispose()
         $sf = New-Object System.Drawing.StringFormat
         $sf.Alignment = $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-        $font = New-Object System.Drawing.Font("Arial", 8)
+        $aboutFontSize = 8.0
+        if ($script:StartupDpiFactor -gt 0) { $aboutFontSize = 8.0 * $script:DPI_Factor / $script:StartupDpiFactor }
+        $font = New-Object System.Drawing.Font("Arial", $aboutFontSize)
         $textBr = if ($script:IsDarkMode) { [System.Drawing.Brushes]::White } else { [System.Drawing.Brushes]::Black }
         $g.DrawString("About", $font, $textBr, (New-Object System.Drawing.RectangleF(0,1,$s.Width,$s.Height)), $sf)
         $font.Dispose(); $sf.Dispose()
@@ -3945,11 +4126,14 @@ $btnAbout.Add_Click({
         $hdrBg  = if ($isDk) { [System.Drawing.Color]::FromArgb(32,32,32) }    else { [System.Drawing.Color]::White }
         $subFg  = if ($isDk) { [System.Drawing.Color]::FromArgb(170,170,170) } else { [System.Drawing.Color]::FromArgb(120,120,120) }
         # About dialog
-        $aboutForm = gen $null "Form" "About" 0 0 380 310 "StartPosition=CenterParent" 'MaximizeBox=$false' 'MinimizeBox=$false' 'FormBorderStyle=FixedDialog' "BackColor=$bgCol" "ForeColor=$fgCol"
+        $aboutForm = gen $null "CustomForm" "About" 0 0 380 310 "StartPosition=CenterParent" 'MaximizeBox=$false' 'MinimizeBox=$false' 'FormBorderStyle=FixedDialog' "BackColor=$bgCol" "ForeColor=$fgCol"
         $aboutForm.SuspendLayout()
         $aboutForm.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Point)
-        $aboutForm.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
-        $aboutForm.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+        # AutoScaleMode.Dpi reads the fossilised startup DeviceDpi under the PS
+        # host, so an ad-hoc dialog opened after a live DPI change renders at the
+        # startup scale (e.g. immense at 100 % if the app started at 150 %). Scale
+        # it manually instead (see Scale-AboutDialog below the ShowDialog).
+        $aboutForm.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
         $aboutForm.ClientSize = New-Object System.Drawing.Size(380, 310)
         $headerPanel = gen $aboutForm "Panel" 0 0 380 90 "BackColor=$hdrBg"
         $headerIcon = gen $headerPanel "PictureBox" 20 13 64 64 "SizeMode=Normal"
@@ -3968,11 +4152,11 @@ $btnAbout.Add_Click({
         })
         gen $headerPanel "Label" "$($script:AppName)" 94 12 0 0 "Font=Arial, 18, Bold" 'AutoSize=$true' "ForeColor=$fgCol" | Out-Null
         gen $headerPanel "Label" "v$($script:Version)" 94 48 0 0 "Font=Arial, 10" 'AutoSize=$true' "ForeColor=$subFg" | Out-Null
-        $btnShowLogs = gen $headerPanel "Button" "Show logs" 160 56 75 26 "FlatStyle=Flat" "Font=Arial, 8" "AutoSize=$true" "BackColor=$bgCol" "ForeColor=$fgCol" 'TabStop=$false'
+        $btnShowLogs = gen $headerPanel "Button" "Show logs" 160 56 75 26 "FlatStyle=Flat" "Font=Arial, 8" "AutoSize=$false" "BackColor=$bgCol" "ForeColor=$fgCol" 'TabStop=$false'
         $btnShowLogs.FlatAppearance.BorderColor = if ($isDk) { [System.Drawing.Color]::FromArgb(80,80,80) } else { [System.Drawing.Color]::FromArgb(180,180,180) }
         $btnShowLogs.Add_Click({ [System.Diagnostics.Process]::Start("explorer.exe", "`"$($script:LogDir)`"") })
         # Pin Start Menu button
-        $btnPinStart = gen $headerPanel "Button" "" 240 56 130 26 "FlatStyle=Flat" "Font=Arial, 8"  "AutoSize=$true" "BackColor=$bgCol" "ForeColor=$fgCol" 'TabStop=$false'
+        $btnPinStart = gen $headerPanel "Button" "" 240 56 130 26 "FlatStyle=Flat" "Font=Arial, 8"  "AutoSize=$false" "BackColor=$bgCol" "ForeColor=$fgCol" 'TabStop=$false'
         $btnPinStart.FlatAppearance.BorderColor = if ($isDk) { [System.Drawing.Color]::FromArgb(80,80,80) } else { [System.Drawing.Color]::FromArgb(180,180,180) }
         $btnPinStart.Text = if ($script:UserPinnedStartMenu) { [char]0x2714 + " Start Menu" } else { "Keep in Start Menu" }
         $btnPinStart.Tag  = $script:UserPinnedStartMenu
@@ -4009,12 +4193,80 @@ $btnAbout.Add_Click({
         gen $aboutForm "Panel" "" 20 160 340 2 "BorderStyle=FixedSingle" | Out-Null
         gen $aboutForm "Label" "Changelog :" 20 174 0 0 "Font=Arial, 10, Bold" "AutoSize=$true" "ForeColor=$fgCol" | Out-Null
         $aboutFormText = @"
+$([char]0x2022)  v1.1 : Live DPI rescaling - UI polish
+          Taskbar pin improvements
+          New Control Panels selector
+
 $([char]0x2022)  v1.0 : Initial release
 "@
         $changelogPanel = gen $aboutForm "Panel" "" 20 195 ($aboutForm.ClientSize.Width - 40) ($aboutForm.ClientSize.Height - 210) "AutoScroll=$true" "BackColor=$bgCol"
-        $changelogLabel = gen $changelogPanel "Label" $aboutFormText 5 0 0 0 "Font=Arial, 9" "AutoSize=$true" "ForeColor=$fgCol"
+        $changelogLabel = gen $changelogPanel "Label" $aboutFormText 5 0 0 0 "Font=Consolas, 8" "AutoSize=$true" "ForeColor=$fgCol"
         $changelogLabel.MaximumSize = New-Object System.Drawing.Size(($changelogPanel.Width - 25), 0)
+        # Manual DPI correction : bounds by the live scale (absolute, built at the
+        # 96-dpi baseline), fonts by live/startup (compensates the dialog's frozen
+        # device context). At startup-dpi both factors resolve to no-ops.
+        $aboutSizeF = [float]$script:DPI_Factor
+        $aboutStartup = [float]$script:StartupDpiFactor; if ($aboutStartup -le 0) { $aboutStartup = $aboutSizeF }
+        $aboutFontF = if ($aboutStartup -gt 0) { $aboutSizeF / $aboutStartup } else { 1.0 }
+        if (([Math]::Abs($aboutSizeF - 1.0) -ge 0.01) -or ([Math]::Abs($aboutFontF - 1.0) -ge 0.01)) {
+            $aboutStack = New-Object System.Collections.Stack
+            $aboutStack.Push($aboutForm)
+            while ($aboutStack.Count -gt 0) {
+                $ac = $aboutStack.Pop()
+                foreach ($ach in $ac.Controls) { $aboutStack.Push($ach) }
+                if ($ac -eq $aboutForm) { continue }
+                try {
+                    if ($ac.Dock -eq [System.Windows.Forms.DockStyle]::None) {
+                        if (-not $ac.AutoSize) { $ac.Size = New-Object System.Drawing.Size([int]($ac.Width * $aboutSizeF), [int]($ac.Height * $aboutSizeF)) }
+                        $ac.Location = New-Object System.Drawing.Point([int]($ac.Location.X * $aboutSizeF), [int]($ac.Location.Y * $aboutSizeF))
+                    } elseif ($ac.Dock -eq [System.Windows.Forms.DockStyle]::Top -or $ac.Dock -eq [System.Windows.Forms.DockStyle]::Bottom) {
+                        $ac.Height = [int]($ac.Height * $aboutSizeF)
+                    }
+                    $acText = ($ac -is [System.Windows.Forms.Label]) -or ($ac -is [System.Windows.Forms.Button]) -or ($ac -is [System.Windows.Forms.LinkLabel]) -or ($ac -is [System.Windows.Forms.TextBox]) -or ($ac -is [System.Windows.Forms.CheckBox])
+                    if ($acText -and $null -ne $ac.Font) { $ac.Font = New-Object System.Drawing.Font($ac.Font.FontFamily, ($ac.Font.Size * $aboutFontF), $ac.Font.Style) }
+                    try { $mx = $ac.MaximumSize; if ($mx.Width -gt 0 -or $mx.Height -gt 0) { $ac.MaximumSize = New-Object System.Drawing.Size([int]($mx.Width * $aboutSizeF), [int]($mx.Height * $aboutSizeF)) } } catch {}
+                } catch {}
+            }
+            $aboutForm.ClientSize = New-Object System.Drawing.Size([int]($aboutForm.ClientSize.Width * $aboutSizeF), [int]($aboutForm.ClientSize.Height * $aboutSizeF))
+        }
         $aboutForm.ResumeLayout($true)
+        # Live DPI change while the About dialog is open : its device context is
+        # frozen at the scale it was built with, so rescale bounds AND fonts by the
+        # incremental ratio (and the ClientSize, since this form does not apply the
+        # OS-suggested rect). The applied scale is kept in a by-ref hashtable.
+        $aboutState = @{ Scale = [float]$script:DPI_Factor }
+        $aboutForm.add_DpiScaleChanged({
+            param($newScale)
+            $old = [float]$aboutState.Scale; if ($old -le 0) { $old = 1.0 }
+            $r = [float]$newScale / $old
+            if ([Math]::Abs($r - 1.0) -lt 0.001) { return }
+            $aboutState.Scale = [float]$newScale
+            $aboutForm.SuspendLayout()
+            try {
+                $rs = New-Object System.Collections.Stack
+                $rs.Push($aboutForm)
+                while ($rs.Count -gt 0) {
+                    $ac = $rs.Pop()
+                    foreach ($ach in $ac.Controls) { $rs.Push($ach) }
+                    if ($ac -eq $aboutForm) { continue }
+                    try {
+                        if ($ac.Dock -eq [System.Windows.Forms.DockStyle]::None) {
+                            if (-not $ac.AutoSize) { $ac.Size = New-Object System.Drawing.Size([int]($ac.Width * $r), [int]($ac.Height * $r)) }
+                            $ac.Location = New-Object System.Drawing.Point([int]($ac.Location.X * $r), [int]($ac.Location.Y * $r))
+                        } elseif ($ac.Dock -eq [System.Windows.Forms.DockStyle]::Top -or $ac.Dock -eq [System.Windows.Forms.DockStyle]::Bottom) {
+                            $ac.Height = [int]($ac.Height * $r)
+                        }
+                        $acText = ($ac -is [System.Windows.Forms.Label]) -or ($ac -is [System.Windows.Forms.Button]) -or ($ac -is [System.Windows.Forms.LinkLabel]) -or ($ac -is [System.Windows.Forms.TextBox]) -or ($ac -is [System.Windows.Forms.CheckBox])
+                        if ($acText -and $null -ne $ac.Font) { $ac.Font = New-Object System.Drawing.Font($ac.Font.FontFamily, ($ac.Font.Size * $r), $ac.Font.Style) }
+                        try { $mx = $ac.MaximumSize; if ($mx.Width -gt 0 -or $mx.Height -gt 0) { $ac.MaximumSize = New-Object System.Drawing.Size([int]($mx.Width * $r), [int]($mx.Height * $r)) } } catch {}
+                    } catch {}
+                }
+                $aboutForm.ClientSize = New-Object System.Drawing.Size([int]($aboutForm.ClientSize.Width * $r), [int]($aboutForm.ClientSize.Height * $r))
+            } finally {
+                $aboutForm.ResumeLayout($true)
+            }
+            $aboutForm.Invalidate($true)
+        }.GetNewClosure())
         $aboutForm.ShowDialog($form) | Out-Null
     }
     catch {
@@ -4026,7 +4278,7 @@ $([char]0x2022)  v1.0 : Initial release
     }
 })
 
-$titleBar.Add_Resize({ $btnAbout.Location = New-Object System.Drawing.Point(([int](($titleBar.Width - $script:notchTopWidth) / 2)), 0) })
+$titleBar.Add_Resize({ $btnAbout.Location = New-Object System.Drawing.Point(([int](($titleBar.Width - $btnAbout.Width) / 2)), 0) })
 $titleBar.Controls.Add($btnAbout)
 $btnAbout.BringToFront()
 
@@ -4105,18 +4357,21 @@ $btnIconPreview.Add_Paint({
 # Icon index context menu
 $script:IconIndexMenu = New-Object System.Windows.Forms.ContextMenuStrip
 $script:IconIndexMenu.ImageScalingSize = New-Object System.Drawing.Size(32, 32)
+$script:IconIndexMenu.Add_Opening({ Build-IconIndexMenuItems })
 $btnIconPreview.Add_Click({
     if (-not $radioIcon_AnyFile.Checked) { return }
     if ($script:CurrentExeIconCount -le 1) { return }
+    Build-IconIndexMenuItems
+    if ($script:IconIndexMenu.Items.Count -eq 0) { return }
     $script:IconIndexMenu.Show($this, (New-Object System.Drawing.Point(0, $this.Height)))
 })
 $labelPreviewIconInfo = gen $groupIcon "Label" "No icon" $xLeft 122 $innerWidth 18 "TextAlign=MiddleCenter" "Anchor=Top,Left,Right"
 
 # Icon source radio buttons
 $labelIconSource = gen $groupIcon "Label" "Get icon from :" $xLeft 149 95 20 "Font=Segoe UI, 9, Bold"
-$radioIcon_TargetDefault = gen $groupIcon "RadioButton" "Target (Default)" ($xLeft + 100) 148 118 22 "Checked=$true"
-$radioIcon_AnyFile = gen $groupIcon "RadioButton" "Any file" ($xLeft + 222) 148 68 22
-$radioIcon_Base64 = gen $groupIcon "RadioButton" "Base64" ($xLeft + 300) 148 65 22
+$radioIcon_TargetDefault = gen $groupIcon "ScalingRadioButton" "Target" ($xLeft + 100) 148 66 22 "Checked=$true"
+$radioIcon_AnyFile = gen $groupIcon "ScalingRadioButton" "Any file" ($xLeft + 170) 148 68 22
+$radioIcon_Base64 = gen $groupIcon "ScalingRadioButton" "Base64" ($xLeft + 248) 148 65 22
 
 # Target Default explanation label (visible by default since Target Default is the default radio)
 $labelTargetDefaultInfo = gen $groupIcon "Label" "No custom icon. Windows will assign the default icon`nbased on the target type, same as a normal shortcut`ncreated from Explorer." $xLeft 176 $innerWidth 44 "Font=Segoe UI, 8.25"
@@ -4129,9 +4384,9 @@ $iconPathTextbox = gen $groupIcon "TextBox" $xLeft 176 ($innerWidth - 90) 20 "An
 $labelDropHint = gen $groupIcon "Label" "You can also drag && drop any file onto this window" $xLeft 210 $innerWidth 20 "TextAlign=TopCenter" "Anchor=Top,Left,Right" "Visible=$false"
 $panelIconMethod = gen $groupIcon "Panel" $xLeft 250 $innerWidth 170 "Anchor=Top,Left,Right" "Visible=$false"
 $labelIconMethod = gen $panelIconMethod "Label" "Icon reference :" 0 0 $innerWidth 18 "Font=Segoe UI, 9, Bold"
-$radioEmbedIcon = gen $panelIconMethod "RadioButton" "Embed icon (ADS injection)" 0 30 $innerWidth 22 "Checked=$true"
+$radioEmbedIcon = gen $panelIconMethod "ScalingRadioButton" "Embed icon (ADS injection)" 0 30 $innerWidth 22 "Checked=$true"
 $labelEmbedInfo = gen $panelIconMethod "Label" "Icon stored inside the .lnk via NTFS Alternate Data Streams.`nIcon lost if shortcut is copied to a non-NTFS drive.`nE.g. USB FAT32, exFAT, cloud..." 0 54 $innerWidth 44 "Font=Segoe UI, 8.25"
-$radioStandardIcon = gen $panelIconMethod "RadioButton" "Standard path" 0 110 $innerWidth 22
+$radioStandardIcon = gen $panelIconMethod "ScalingRadioButton" "Standard path" 0 110 $innerWidth 22
 $labelStandardInfo = gen $panelIconMethod "Label" "Shortcut points to an existing .ico / .exe / .dll on disk.`nIcon breaks if the referenced file is moved or deleted." 0 134 $innerWidth 44 "Font=Segoe UI, 8.25"
 
 # Base64 textbox
@@ -4155,8 +4410,9 @@ $innerWidthR = $drR.Width - ($script:GroupPadding * 2)
 # Target path
 $labelTarget = gen $groupShortcut "Label" "Target (executable, file, folder, or command) :" $xLeftR 23 250 18  "AutoSize=$true"
 $labelTargetLen = gen $groupShortcut "Label" "0 / $($script:MaxTargetPath)" ($xLeftR + 252) 25 ($innerWidthR - 290) 18 "TextAlign=TopRight" "Font=Segoe UI, 7.5" "Anchor=Top,Left,Right" "AutoSize=$true"
-$btnBrowseTarget = gen $groupShortcut "Button" "Browse..." ($xLeftR + $innerWidthR - 80) 45 80 20 "Anchor=Top,Right"
-$textTarget = gen $groupShortcut "TextBox" $xLeftR 45 ($innerWidthR - 90) 20 "Anchor=Top,Left,Right"
+$btnBrowseTarget = gen $groupShortcut "Button" "Browse..." ($xLeftR + $innerWidthR - 70) 45 70 20 "Anchor=Top,Right"
+$btnControlPanel = gen $groupShortcut "Button" "Control Panel" ($xLeftR + $innerWidthR - 166) 45 88 20 "Anchor=Top,Right"
+$textTarget = gen $groupShortcut "TextBox" $xLeftR 45 ($innerWidthR - 174) 20 "Anchor=Top,Left,Right"
 
 # Arguments
 $labelArgs = gen $groupShortcut "Label" "Arguments (optional) :" $xLeftR 78 150 18 "AutoSize=$true"
@@ -4168,8 +4424,8 @@ $labelExplorerWarn = gen $labelArgsLen "Label" "" "Dock=Fill" "Font=Segoe UI, 7.
 
 # Working directory
 $labelWorkDir = gen $groupShortcut "Label" "Working directory (optional) :" $xLeftR 196 $innerWidthR 18 "AutoSize=$true"
-$btnBrowseWorkDir = gen $groupShortcut "Button" "Browse..." ($xLeftR + $innerWidthR - 80) 217 80 20 "Anchor=Top,Right"
-$textWorkDir = gen $groupShortcut "TextBox" $xLeftR 217 ($innerWidthR - 90) 20 "Anchor=Top,Left,Right"
+$btnBrowseWorkDir = gen $groupShortcut "Button" "Browse..." ($xLeftR + $innerWidthR - 70) 217 70 20 "Anchor=Top,Right"
+$textWorkDir = gen $groupShortcut "TextBox" $xLeftR 217 ($innerWidthR - 80) 20 "Anchor=Top,Left,Right"
 
 # Description
 $labelDescription = gen $groupShortcut "Label" "Comment / Description (optional) :" $xLeftR 250 $innerWidthR 18 "AutoSize=$true"
@@ -4182,8 +4438,8 @@ $textAumid = gen $groupShortcut "TextBox" $xLeftR 327 $innerWidthR 20 "Anchor=To
 
 # Shortcut location (.lnk)
 $labelLnkPath = gen $groupShortcut "Label" "Shortcut location (.lnk) :" $xLeftR 360 $innerWidthR 18 "Anchor=Top,Left,Right"
-$btnBrowseLnk = gen $groupShortcut "Button" "Browse..." ($xLeftR + $innerWidthR - 80) 380 80 20 "Anchor=Top,Right"
-$textLnkPath = gen $groupShortcut "TextBox" $xLeftR 380 ($innerWidthR - 90) 20 "Anchor=Top,Left,Right"
+$btnBrowseLnk = gen $groupShortcut "Button" "Browse..." ($xLeftR + $innerWidthR - 70) 380 70 20 "Anchor=Top,Right"
+$textLnkPath = gen $groupShortcut "TextBox" $xLeftR 380 ($innerWidthR - 80) 20 "Anchor=Top,Left,Right"
 $labelLnkInfo = gen $groupShortcut "Label" "" $xLeftR 406 $innerWidthR 18 "Font=Segoe UI, 7.5" "Anchor=Top,Left,Right"
 
 # Create / Pin / Test buttons
@@ -4297,7 +4553,7 @@ function Set-Theme {
     # Radio buttons
     foreach ($rb in @($radioIcon_TargetDefault, $radioIcon_Base64, $radioIcon_AnyFile, $radioEmbedIcon, $radioStandardIcon)) { $rb.ForeColor = $theme.Fore }
     # Standard buttons
-    foreach ($btn in @($btnBrowseIcon, $btnBrowseTarget, $btnBrowseLnk, $btnBrowseWorkDir, $btnPin)) {
+    foreach ($btn in @($btnBrowseIcon, $btnBrowseTarget, $btnBrowseLnk, $btnBrowseWorkDir, $btnControlPanel, $btnPin)) {
         $btn.BackColor = $theme.BtnBack; $btn.ForeColor = $theme.Fore
         $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
         $btn.FlatAppearance.BorderColor = $theme.Border
@@ -4402,13 +4658,8 @@ $radioIcon_Base64.Add_CheckedChanged($script:IconRadioChangedHandler)
 
 $TextboxIcon_Base64.Add_TextChanged({
     if ($script:SuppressPreviewUpdate) { return }
-    $form.UseWaitCursor = $true
-    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    [System.Windows.Forms.Application]::DoEvents()
-    Update-IconPreview
-    Update-NtfsWarning
-    $form.UseWaitCursor = $false
-    $form.Cursor = [System.Windows.Forms.Cursors]::Default
+    $script:Base64DebounceTimer.Stop()
+    $script:Base64DebounceTimer.Start()
 })
 
 # File path text changed
@@ -4455,6 +4706,264 @@ $btnBrowseIcon.Add_Click({
 })
 
 # Browse for target
+# Control Panel picker : lists installed .cpl / .msc applets (icon + file name +
+# metadata description) with a live search box. Apply behaves exactly like
+# dropping the selected file on the Target zone (Invoke-ZoneDrop ... 'target').
+# All state is $script:-scope + plain event handlers, because GetNewClosure
+# handlers can't reach script-scope functions under this host's launch model.
+function Get-ControlPanelItems {
+    $result = New-Object System.Collections.Generic.List[object]
+    $sys = [IO.Path]::Combine($env:SystemRoot, "System32")
+    foreach ($pat in @("*.cpl", "*.msc")) {
+        $files = @(); try { $files = [IO.Directory]::GetFiles($sys, $pat) } catch {}
+        foreach ($fp in $files) {
+            $desc = ""
+            try { $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($fp); if ($vi -and $vi.FileDescription) { $desc = ([string]$vi.FileDescription).Trim() } } catch {}
+            [void]$result.Add([pscustomobject]@{ Path = $fp; Name = [IO.Path]::GetFileName($fp); Description = $desc; ImgIdx = -1 })
+        }
+    }
+    return @($result | Sort-Object Name)
+}
+function Update-CpList([string]$filter) {
+    if ($null -eq $script:CpLv) { return }
+    $f = ([string]$filter).Trim().ToLower()
+    $script:CpLv.BeginUpdate()
+    $script:CpLv.Items.Clear()
+    foreach ($it in $script:CpItems) {
+        if ($f -ne "" -and -not ($it.Name.ToLower().Contains($f) -or $it.Description.ToLower().Contains($f))) { continue }
+        $lvi = New-Object System.Windows.Forms.ListViewItem($it.Name)
+        if ($it.ImgIdx -ge 0) { $lvi.ImageIndex = $it.ImgIdx }
+        [void]$lvi.SubItems.Add($it.Description)
+        $lvi.Tag = $it.Path
+        [void]$script:CpLv.Items.Add($lvi)
+    }
+    $script:CpLv.EndUpdate()
+}
+function Invoke-CpApply {
+    if ($null -eq $script:CpLv -or $script:CpLv.SelectedItems.Count -eq 0) { return }
+    $path = [string]$script:CpLv.SelectedItems[0].Tag
+    $script:CpDlg.Close()
+    Invoke-ZoneDrop $path 'target'
+}
+function Scale-ModalTree($modal, $sizeF, $fontF) {
+    $doF = ([Math]::Abs([float]$fontF - 1.0) -ge 0.001)
+    $doS = ([Math]::Abs([float]$sizeF - 1.0) -ge 0.001)
+    $rs = New-Object System.Collections.Stack; $rs.Push($modal)
+    while ($rs.Count -gt 0) {
+        $ac = $rs.Pop(); foreach ($ach in $ac.Controls) { $rs.Push($ach) }
+        if ($ac -eq $modal) { continue }
+        try {
+            if ($doS -and $ac.Dock -eq [System.Windows.Forms.DockStyle]::None) {
+                if (-not $ac.AutoSize) { $ac.Size = New-Object System.Drawing.Size([int]($ac.Width * $sizeF), [int]($ac.Height * $sizeF)) }
+                $ac.Location = New-Object System.Drawing.Point([int]($ac.Location.X * $sizeF), [int]($ac.Location.Y * $sizeF))
+            }
+            $t = ($ac -is [System.Windows.Forms.Label]) -or ($ac -is [System.Windows.Forms.Button]) -or ($ac -is [System.Windows.Forms.TextBox]) -or ($ac -is [System.Windows.Forms.CheckBox]) -or ($ac -is [System.Windows.Forms.ListView])
+            if ($doF -and $t -and $null -ne $ac.Font) { $ac.Font = New-Object System.Drawing.Font($ac.Font.FontFamily, ($ac.Font.Size * $fontF), $ac.Font.Style) }
+        } catch {}
+    }
+}
+# Position search / list / buttons from the CURRENT client size (buttons pinned
+# to the bottom) so a live DPI change can't push them past the modal edge.
+function Layout-CpModal {
+    if ($null -eq $script:CpDlg) { return }
+    $sc = [float]$script:CpScale; if ($sc -le 0) { $sc = 1.0 }
+    $cw = $script:CpDlg.ClientSize.Width; $ch = $script:CpDlg.ClientSize.Height
+    $m = [int](12 * $sc); $gap = [int](8 * $sc)
+    $script:CpSearch.Location = New-Object System.Drawing.Point($m, $m)
+    $script:CpSearch.Width = $cw - 2 * $m
+    $by = $ch - $m - $script:CpBtnApply.Height
+    $script:CpBtnClose.Location = New-Object System.Drawing.Point($m, $by)
+    $script:CpBtnApply.Location = New-Object System.Drawing.Point(($cw - $m - $script:CpBtnApply.Width), $by)
+    $lvTop = $m + $script:CpSearch.Height + $gap
+    $script:CpLv.Location = New-Object System.Drawing.Point($m, $lvTop)
+    $script:CpLv.Size = New-Object System.Drawing.Size(($cw - 2 * $m), [Math]::Max(40, ($by - $lvTop - $gap)))
+}
+function Show-ControlPanelPicker {
+    $isDk  = $script:IsDarkMode
+    $bgCol = if ($isDk) { [System.Drawing.Color]::FromArgb(45,45,48) }  else { [System.Drawing.Color]::FromArgb(243,243,243) }
+    $fgCol = if ($isDk) { [System.Drawing.Color]::White }                else { [System.Drawing.Color]::Black }
+    $ctlBg = if ($isDk) { [System.Drawing.Color]::FromArgb(30,30,30) }  else { [System.Drawing.Color]::White }
+    $btnBg = if ($isDk) { [System.Drawing.Color]::FromArgb(60,60,63) }  else { [System.Drawing.Color]::FromArgb(225,225,225) }
+    $brdC  = if ($isDk) { [System.Drawing.Color]::FromArgb(80,80,80) }  else { [System.Drawing.Color]::FromArgb(160,160,160) }
+    $script:CpHdrBg  = if ($isDk) { [System.Drawing.Color]::FromArgb(55,55,58) } else { [System.Drawing.Color]::FromArgb(230,230,230) }
+    $script:CpHdrFg  = $fgCol
+    $script:CpHdrSep = $brdC
+    # Row colours for the owner-drawn cells (plain handlers can only see $script:
+    # scope). Normal rows keep the list background so they look untouched ; only
+    # the selected row gets a fill. Text stays $fgCol on every state so it never
+    # flips to black. Muted blue (the project GroupBorder tone, not the bright
+    # accent) so a selected row reads as selected without a garish fill.
+    $script:CpItemBg = $ctlBg
+    $script:CpItemFg = $fgCol
+    $script:CpSelBg  = if ($isDk) { [System.Drawing.Color]::FromArgb(50,90,120) }  else { [System.Drawing.Color]::FromArgb(204,232,255) }
+
+    $form.UseWaitCursor = $true; [System.Windows.Forms.Application]::DoEvents()
+    try { $script:CpItems = @(Get-ControlPanelItems) } finally { $form.UseWaitCursor = $false }
+
+    $dlg = New-Object CustomForm
+    $dlg.Text = "Control Panel  -  pick a .cpl / .msc"
+    $dlg.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+    $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false; $dlg.ShowInTaskbar = $false
+    $dlg.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dlg.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::None
+    $dlg.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $dlg.BackColor = $bgCol; $dlg.ForeColor = $fgCol
+    $dlg.ClientSize = New-Object System.Drawing.Size(620, 440)
+    $dlg.SuspendLayout()
+    $script:CpDlg = $dlg
+
+    $search = New-Object System.Windows.Forms.TextBox
+    $search.Location = New-Object System.Drawing.Point(12, 12)
+    $search.Size = New-Object System.Drawing.Size(446, 24)
+    $search.BackColor = $ctlBg; $search.ForeColor = $fgCol; $search.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $dlg.Controls.Add($search); $script:CpSearch = $search
+
+    $lv = New-Object System.Windows.Forms.ListView
+    $lv.Location = New-Object System.Drawing.Point(12, 44)
+    $lv.Size = New-Object System.Drawing.Size(446, 340)
+    $lv.View = [System.Windows.Forms.View]::Details
+    $lv.FullRowSelect = $true; $lv.MultiSelect = $false; $lv.HideSelection = $false
+    $lv.HeaderStyle = [System.Windows.Forms.ColumnHeaderStyle]::Nonclickable
+    $lv.BackColor = $ctlBg; $lv.ForeColor = $fgCol; $lv.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    [void]$lv.Columns.Add("Name", 160)
+    [void]$lv.Columns.Add("Description", 272)
+    $dlg.Controls.Add($lv); $script:CpLv = $lv
+
+    $img = New-Object System.Windows.Forms.ImageList
+    $isz = [Math]::Max(16, [int](18 * $script:DPI_Factor))
+    $img.ImageSize = New-Object System.Drawing.Size($isz, $isz)
+    $img.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
+    $lv.SmallImageList = $img; $script:CpImg = $img
+    foreach ($it in $script:CpItems) {
+        try { $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($it.Path); if ($null -ne $ico) { $img.Images.Add($ico.ToBitmap()); $it.ImgIdx = $img.Images.Count - 1; $ico.Dispose() } } catch {}
+    }
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text = "Close"; $btnClose.Size = New-Object System.Drawing.Size(96, 28)
+    $btnClose.Location = New-Object System.Drawing.Point(12, 400)
+    $btnClose.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $btnClose.BackColor = $btnBg; $btnClose.ForeColor = $fgCol
+    $btnClose.FlatAppearance.BorderColor = $brdC
+    $dlg.Controls.Add($btnClose)
+
+    $btnApply = New-Object System.Windows.Forms.Button
+    $btnApply.Text = "Apply"; $btnApply.Size = New-Object System.Drawing.Size(96, 28)
+    $btnApply.Location = New-Object System.Drawing.Point(362, 400)
+    $btnApply.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat; $btnApply.BackColor = $btnBg; $btnApply.ForeColor = $fgCol
+    $btnApply.FlatAppearance.BorderColor = $brdC
+    $dlg.Controls.Add($btnApply)
+    $script:CpBtnClose = $btnClose; $script:CpBtnApply = $btnApply
+
+    # Owner-draw : the header follows the dark theme (native headers stay light),
+    # and each row paints its own background + icon + text so selected / hot rows
+    # keep white text instead of the theme's black. Flicker is handled by native
+    # LVS_EX_DOUBLEBUFFER, enabled once the handle exists (Add_Shown).
+    $lv.OwnerDraw = $true
+    $lv.Add_DrawColumnHeader({
+        param($s, $e)
+        $e.Graphics.FillRectangle((New-Object System.Drawing.SolidBrush($script:CpHdrBg)), $e.Bounds)
+        $tr = New-Object System.Drawing.Rectangle(($e.Bounds.X + 6), $e.Bounds.Y, ($e.Bounds.Width - 8), $e.Bounds.Height)
+        $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $e.Header.Text, $s.Font, $tr, $script:CpHdrFg, $flags)
+        $pen = New-Object System.Drawing.Pen($script:CpHdrSep)
+        $e.Graphics.DrawLine($pen, ($e.Bounds.Right - 1), $e.Bounds.Y, ($e.Bounds.Right - 1), $e.Bounds.Bottom)
+        $e.Graphics.DrawLine($pen, $e.Bounds.X, ($e.Bounds.Bottom - 1), $e.Bounds.Right, ($e.Bounds.Bottom - 1))
+        $pen.Dispose()
+    })
+    # Fully owner-draw the rows so the DarkMode_Explorer theme never repaints a
+    # selected row with black text : fill the background, then draw the icon +
+    # text ourselves, always in $script:CpItemFg (white in dark mode). Use
+    # $e.Item.Selected (authoritative) - the $e.State bitfield is unreliable for a
+    # Details-view owner-drawn ListView and reported Selected for EVERY row, which
+    # painted the whole list blue.
+    $lv.Add_DrawItem({
+        param($s, $e)
+        $bg = if ($e.Item.Selected) { $script:CpSelBg } else { $script:CpItemBg }
+        $br = New-Object System.Drawing.SolidBrush($bg)
+        $e.Graphics.FillRectangle($br, $e.Bounds)
+        $br.Dispose()
+    })
+    $lv.Add_DrawSubItem({
+        param($s, $e)
+        $tx = $e.Bounds.X + 6
+        if ($e.ColumnIndex -eq 0) {
+            $il = $s.SmallImageList; $ii = $e.Item.ImageIndex
+            if ($null -ne $il -and $ii -ge 0 -and $ii -lt $il.Images.Count) {
+                $iw = $il.ImageSize.Width; $ih = $il.ImageSize.Height
+                $iy = $e.Bounds.Y + [int](($e.Bounds.Height - $ih) / 2)
+                $e.Graphics.DrawImage($il.Images[$ii], ($e.Bounds.X + 4), $iy, $iw, $ih)
+                $tx = $e.Bounds.X + 4 + $iw + 5
+            }
+            $txt = $e.Item.Text
+        } elseif ($null -ne $e.SubItem) {
+            $txt = $e.SubItem.Text
+        } else {
+            $txt = ""
+        }
+        $tw = $e.Bounds.Right - $tx - 2; if ($tw -lt 0) { $tw = 0 }
+        $tr = New-Object System.Drawing.Rectangle($tx, $e.Bounds.Y, $tw, $e.Bounds.Height)
+        $flags = [System.Windows.Forms.TextFormatFlags]::VerticalCenter -bor [System.Windows.Forms.TextFormatFlags]::Left -bor [System.Windows.Forms.TextFormatFlags]::EndEllipsis
+        [System.Windows.Forms.TextRenderer]::DrawText($e.Graphics, $txt, $s.Font, $tr, $script:CpItemFg, $flags)
+    })
+
+    $search.Add_TextChanged({ Update-CpList $this.Text })
+    $lv.Add_DoubleClick({ Invoke-CpApply })
+    $lv.Add_KeyDown({ param($s, $ev) if ($ev.KeyCode -eq [System.Windows.Forms.Keys]::Enter) { Invoke-CpApply } })
+    $lv.Add_Resize({ if ($null -ne $script:CpLv -and $script:CpLv.Columns.Count -ge 2) { $w = $script:CpLv.ClientSize.Width; $c0 = [int]($w * 0.34); $script:CpLv.Columns[0].Width = $c0; $script:CpLv.Columns[1].Width = [Math]::Max(40, $w - $c0 - 4) } })
+    $btnApply.Add_Click({ Invoke-CpApply })
+    $btnClose.Add_Click({ $script:CpDlg.Close() })
+
+    Update-CpList ""
+    $dlg.ResumeLayout($true)
+
+    $cpSizeF = [float]$script:DPI_Factor
+    $cpStartup = [float]$script:StartupDpiFactor; if ($cpStartup -le 0) { $cpStartup = $cpSizeF }
+    $cpFontF = if ($cpStartup -gt 0) { $cpSizeF / $cpStartup } else { 1.0 }
+    if (([Math]::Abs($cpSizeF - 1.0) -ge 0.01) -or ([Math]::Abs($cpFontF - 1.0) -ge 0.01)) {
+        Scale-ModalTree $dlg $cpSizeF $cpFontF
+        $dlg.ClientSize = New-Object System.Drawing.Size([int]($dlg.ClientSize.Width * $cpSizeF), [int]($dlg.ClientSize.Height * $cpSizeF))
+    }
+    $script:CpScale = $cpSizeF
+    Layout-CpModal
+
+    $dlg.add_DpiScaleChanged({
+        param($newScale)
+        $old = [float]$script:CpScale; if ($old -le 0) { $old = 1.0 }
+        $r = [float]$newScale / $old
+        if ([Math]::Abs($r - 1.0) -lt 0.001) { return }
+        $script:CpScale = [float]$newScale
+        $script:CpDlg.SuspendLayout()
+        try {
+            Scale-ModalTree $script:CpDlg $r $r
+            $script:CpDlg.ClientSize = New-Object System.Drawing.Size([int]($script:CpDlg.ClientSize.Width * $r), [int]($script:CpDlg.ClientSize.Height * $r))
+            Layout-CpModal
+        } finally { $script:CpDlg.ResumeLayout($true) }
+        $script:CpDlg.Invalidate($true)
+    })
+
+    $dlg.Add_Shown({
+        try {
+            if ($script:IsDarkMode) {
+                [DarkMode]::SetAppMode($true)
+                [DarkMode]::ApplyControl($script:CpDlg.Handle, $true)
+                [DarkMode]::ApplyControl($script:CpLv.Handle, $true)
+            }
+            # Native double-buffering for the owner-drawn ListView (LVM_SETEXTENDED-
+            # LISTVIEWSTYLE=0x1036, LVS_EX_DOUBLEBUFFER=0x10000). The managed
+            # DoubleBuffered flag does not cover comctl32's own painting, so this
+            # is what actually stops the hover / scroll flicker.
+            [void][NativeMethods]::SendMessage($script:CpLv.Handle, 0x1036, 0x10000, 0x10000)
+        } catch {}
+        try { $script:CpSearch.Focus() } catch {}
+    })
+
+    [void]$dlg.ShowDialog($form)
+
+    try { $img.Dispose() } catch {}
+    try { $dlg.Dispose() } catch {}
+    $script:CpDlg = $null; $script:CpLv = $null; $script:CpItems = $null; $script:CpImg = $null; $script:CpSearch = $null; $script:CpBtnClose = $null; $script:CpBtnApply = $null
+}
+$btnControlPanel.Add_Click({ Show-ControlPanelPicker })
+
 $btnBrowseTarget.Add_Click({
     $ofd = New-Object System.Windows.Forms.OpenFileDialog
     $ofd.Title = "Select target file"
@@ -4476,6 +4985,9 @@ $btnBrowseTarget.Add_Click({
                     Update-IconPreview
                 }
             }
+        }
+        elseif ($selectedExt -eq '.msc') {
+            $radioIcon_TargetDefault.Checked = $true
         }
         elseif (Test-IconSourceEmpty) {
             $radioIcon_TargetDefault.Checked = $true
@@ -4501,6 +5013,7 @@ $textTarget.Add_TextChanged({
         $script:ShellTargetIconCache = $null
     }
     $currentText = $textTarget.Text
+    if ($currentText -ne $script:PreviousTargetText) { $script:DeclinedSplitText = $null }
     $len = (Get-CleanInput $currentText).Length
     $labelTargetLen.Text = "$len / $($script:MaxTargetPath)"
     $labelTargetLen.ForeColor = if ($len -gt $script:MaxTargetPath) { [System.Drawing.Color]::Red } else {
@@ -4704,7 +5217,14 @@ $btnCreate.Add_Click({
             Write-Log "Created directory for shortcut : $lnkDir"
         }
         $existingLnk = [IO.File]::Exists($lnkPath)
-        if ($existingLnk) { [IO.File]::Delete($lnkPath) }
+        $backupPath  = $null
+        if ($existingLnk) {
+            $backupPath = $lnkPath + '.bak'
+            if ([IO.File]::Exists($backupPath)) { [IO.File]::Delete($backupPath) }
+            [IO.File]::Move($lnkPath, $backupPath)
+        }
+        $saveCommitted = $false
+        try {
         # Detect .cpl targets and auto-convert to shell shortcut
         $createTargetPath = Get-CleanInput $textTarget.Text
         $createTargetExt = ''
@@ -4741,6 +5261,7 @@ $btnCreate.Add_Click({
                 else {
                     [ShortcutHelper]::CreateShellWithStandardIcon($lnkPath, $cplItem.Path, "", 0, $userAumid, $userDesc)
                 }
+                $saveCommitted = $true
                 $action = if ($existingLnk) { "updated" } else { "created" }
                 Write-Log "CPL shortcut $action via PIDL : $lnkPath -> $($cplItem.Path)"
                 Invoke-CreateButtonFlash ([char]0x2714 + " " + ($action.Substring(0,1).ToUpper() + $action.Substring(1)))
@@ -4766,6 +5287,7 @@ $btnCreate.Add_Click({
                 [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
             return
         }
+        $saveCommitted = $true
         # Build result message
         $action    = if ($existingLnk) { "updated" } else { "created" }
         $targetPath = Get-CleanInput $textTarget.Text
@@ -4788,6 +5310,20 @@ $btnCreate.Add_Click({
         }
         Write-Log "$typeLabel $action : $lnkPath ($($result.IconMode))"
         Invoke-CreateButtonFlash ([char]0x2714 + " " + ($action.Substring(0,1).ToUpper() + $action.Substring(1)))
+        }
+        finally {
+            if ($null -ne $backupPath -and [IO.File]::Exists($backupPath)) {
+                if ($saveCommitted) {
+                    try { [IO.File]::Delete($backupPath) } catch {}
+                }
+                else {
+                    try {
+                        if ([IO.File]::Exists($lnkPath)) { [IO.File]::Delete($lnkPath) }
+                        [IO.File]::Move($backupPath, $lnkPath)
+                    } catch {}
+                }
+            }
+        }
     }
     catch {
         Write-Log "Error creating shortcut : $($_.Exception.Message)" -Level Error
@@ -4798,12 +5334,13 @@ $btnCreate.Add_Click({
 })
 
 $btnPin.Add_Click({
-    $form.UseWaitCursor = $true
-    $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
-    [System.Windows.Forms.Application]::DoEvents()
     $tempLnkCreated = $false
     $lnkToPin = $null
     try {
+        $btnPin.Enabled = $false
+        $form.UseWaitCursor = $true
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        [System.Windows.Forms.Application]::DoEvents()
         $lnkPath = Get-CleanInput $textLnkPath.Text
         # Case 1 : existing .lnk on disk
         if ((-not (Test-StringEmpty $lnkPath)) -and $lnkPath.EndsWith('.lnk', [System.StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists($lnkPath)) {
@@ -4909,6 +5446,7 @@ $btnPin.Add_Click({
         if ($tempLnkCreated -and $lnkToPin -and [IO.File]::Exists($lnkToPin)) {
             try { [IO.File]::Delete($lnkToPin) } catch {}
         }
+        $btnPin.Enabled = $true
         $form.UseWaitCursor = $false
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
     }
@@ -4917,6 +5455,10 @@ $btnPin.Add_Click({
 #region ── GLOBAL EVENTS ─
 
 Update-LoadingPopup 90 "Loading..."
+
+# Refresh the Pin button when the window regains focus, so an external unpin done
+# from the taskbar while the app was in the background is reflected on return.
+$form.Add_Activated({ try { Update-PinButtonState } catch {} })
 
 # ── Drop zone cache ──
 $script:CachedDropZones = $null
@@ -5015,6 +5557,70 @@ $form.add_OnWindowMessage({
     }
 })
 
+# Live per-monitor DPI change. Geometry is rescaled with the framework's own
+# Control.Scale (which repositions/resizes every control AND honours anchors,
+# so nested anchored controls inside Dock=Fill containers don't collapse).
+# Control.Scale does NOT touch fonts, so those are scaled separately on the
+# leaf controls (and the two group boxes, which paint their own title).
+$form.add_DpiScaleChanged({
+    param($newScale)
+    $oldScale = $script:DPI_Factor
+    if ($null -eq $oldScale -or $oldScale -le 0) { $oldScale = 1.0 }
+    $ratio = [float]$newScale / [float]$oldScale
+    if ($ratio -le 0) { $ratio = 1 }
+    if ([Math]::Abs($ratio - 1.0) -lt 0.001) { return }
+
+    $script:DpiFontCache = @{}
+    $getScaledFont = {
+        param($f, $r)
+        $sz  = [float]$f.Size * [float]$r
+        $key = '{0}|{1}|{2}' -f $f.FontFamily.Name, $sz, [int]$f.Style
+        if ($script:DpiFontCache.ContainsKey($key)) { return $script:DpiFontCache[$key] }
+        $nf = New-Object System.Drawing.Font($f.FontFamily, $sz, $f.Style)
+        $script:DpiFontCache[$key] = $nf
+        return $nf
+    }
+
+    $formLoc = $form.Location
+    $form.SuspendLayout()
+    try {
+        $form.Scale((New-Object System.Drawing.SizeF([float]$ratio, [float]$ratio)))
+
+        $stack = New-Object System.Collections.Stack
+        $stack.Push($form)
+        while ($stack.Count -gt 0) {
+            $c = $stack.Pop()
+            foreach ($ch in $c.Controls) { $stack.Push($ch) }
+            if ($c -eq $form) { continue }
+            $isLeaf = ($c -is [System.Windows.Forms.Label]) -or
+                      ($c -is [System.Windows.Forms.Button]) -or
+                      ($c -is [System.Windows.Forms.TextBox]) -or
+                      ($c -is [System.Windows.Forms.RadioButton]) -or
+                      ($c -is [System.Windows.Forms.CheckBox]) -or
+                      ($c -is [TitleBarButton])
+            try { if ($isLeaf -and $null -ne $c.Font) { $c.Font = & $getScaledFont $c.Font $ratio } } catch {}
+        }
+        # Group box titles are painted from the control Font (not a leaf control).
+        foreach ($g in @($groupIcon, $groupShortcut)) {
+            try { if ($null -ne $g.Font) { $g.Font = & $getScaledFont $g.Font $ratio } } catch {}
+        }
+        $script:DPI_Factor = [float]$newScale
+    } finally {
+        $form.Location = $formLoc
+        $form.ResumeLayout($true)
+        $script:DpiFontCache = $null
+    }
+    # The About trapezoid derives its inset from the button's ACTUAL Width and
+    # the constant notchBottomWidth/notchTopWidth ratio (scale-invariant), so
+    # both the region and the border stay matched — the notch vars must NOT be
+    # rescaled. Only re-center the button, authoritatively, after Control.Scale
+    # + the titleBar Resize handler.
+    try {
+        $btnAbout.Location = New-Object System.Drawing.Point([int](($titleBar.Width - $btnAbout.Width) / 2), 0)
+    } catch {}
+    $form.Invalidate($true)
+})
+
 $form.Add_Load({
     Update-LoadingPopup 95 "Finalizing..."
     # Detect and apply system theme before the form becomes visible
@@ -5068,6 +5674,7 @@ function Invoke-ApplicationCleanup {
     $script:HitTestNativeWindows.Clear()
     # Stop debounce timer
     try { $script:CreateBtnDebounceTimer.Stop(); $script:CreateBtnDebounceTimer.Dispose() } catch {}
+    try { $script:Base64DebounceTimer.Stop(); $script:Base64DebounceTimer.Dispose() } catch {}
     try { Reset-CreateButtonFlash } catch {}
     # Dispose GDI resources
     foreach ($pen in @($script:FormBorderPenLight, $script:FormBorderPenDark, $script:DropZonePen, $script:GroupBoxBorderPen)) {
