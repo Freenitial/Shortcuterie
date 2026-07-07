@@ -6,7 +6,7 @@ A Windows shortcut (.lnk) creation tool that can embeds custom icons directly in
 ![Windows 7](https://img.shields.io/badge/Windows-7%2B-blue?logo=windows)
 ![PowerShell 2.0](https://img.shields.io/badge/PowerShell-2.0%2B-blue?logo=powershell)
 
-<img width="840" height="540" alt="image" src="https://github.com/user-attachments/assets/7c53098e-5859-40c7-b4e0-63a89faa8cf3" />
+<img width="840" height="540" alt="Capture d&#39;écran 2026-07-07 191829" src="https://github.com/user-attachments/assets/6993fdbe-2454-4453-a131-5d7173271734" />
 
 ## Features
 
