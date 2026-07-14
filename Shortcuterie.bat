@@ -67,7 +67,7 @@
 #region ── VERSION & PATHS ─
 
 $script:AppName       = "Shortcuterie"
-$script:Version       = [version]"1.1"
+$script:Version       = [version]"1.2"
 
 # ---- Remaining functions for Invoke-LoadingPump + updates ----
 $t=$d.DefineType('E','Public,Class')
@@ -2623,28 +2623,41 @@ function Invoke-TaskbarPin {
         }
     }
     Write-Log "Taskbar pin : beef001d = '$beef001d'" -Level Debug
-    # Copy .lnk to taskbar pinned directory
+    # Copy .lnk to taskbar pinned directory. Mirror Pin-Taskbar.ps1 : an already-pinned
+    # destination .lnk is REUSED as-is, never overwritten. Overwriting (or re-saving) a
+    # live pin desyncs the file from its registry blob entry and triggers an
+    # SHCNE_UPDATEITEM burst that corrupts the taskbar icon cache.
     $destLnk = [IO.Path]::Combine($taskBarDir, [IO.Path]::GetFileName($LnkPath))
-    try { [IO.File]::Copy($LnkPath, $destLnk, $true) }
-    catch {
-        Write-Log "Failed to copy .lnk to taskbar directory : $($_.Exception.Message)" -Level Error
-        return $false
+    $destAlreadyPinned = [IO.File]::Exists($destLnk)
+    if (-not $destAlreadyPinned) {
+        try { [IO.File]::Copy($LnkPath, $destLnk, $true) }
+        catch {
+            Write-Log "Failed to copy .lnk to taskbar directory : $($_.Exception.Message)" -Level Error
+            return $false
+        }
+    }
+    else {
+        Write-Log "Taskbar pin : destination already present, reusing existing .lnk : $destLnk" -Level Debug
     }
     $script:LastPinnedTaskbarFile = [IO.Path]::GetFileName($destLnk)
     $script:LastPinnedConfigKey   = (Get-CleanInput $textTarget.Text) + '|' + (Get-CleanInput $textLnkPath.Text)
-    # Repoint ADS IconLocation to the copied file path, then re-embed ADS (Save wipes it)
-    try {
-        $currentIconPath = [ShortcutHelper]::GetIconPath($destLnk)
-        if ((-not [string]::IsNullOrEmpty($currentIconPath)) -and $currentIconPath.EndsWith(':icon.ico', [System.StringComparison]::OrdinalIgnoreCase)) {
-            $adsBytes = [AdsHelper]::ReadStream($destLnk, "icon.ico")
-            [ShortcutHelper]::UpdateIconOnly($destLnk)
-            if ($null -ne $adsBytes -and $adsBytes.Length -gt 0) {
-                [AdsHelper]::WriteStream($destLnk, "icon.ico", $adsBytes)
-                Write-Log "Taskbar pin : IconLocation repointed + ADS re-embedded ($($adsBytes.Length) bytes)" -Level Debug
+    # Repoint ADS IconLocation to the copied file path, then re-embed ADS (Save wipes it).
+    # Only on a freshly copied file : re-saving an already-pinned .lnk is exactly the
+    # mutation that corrupts the live pin, so it is skipped when the file is reused.
+    if (-not $destAlreadyPinned) {
+        try {
+            $currentIconPath = [ShortcutHelper]::GetIconPath($destLnk)
+            if ((-not [string]::IsNullOrEmpty($currentIconPath)) -and $currentIconPath.EndsWith(':icon.ico', [System.StringComparison]::OrdinalIgnoreCase)) {
+                $adsBytes = [AdsHelper]::ReadStream($destLnk, "icon.ico")
+                [ShortcutHelper]::UpdateIconOnly($destLnk)
+                if ($null -ne $adsBytes -and $adsBytes.Length -gt 0) {
+                    [AdsHelper]::WriteStream($destLnk, "icon.ico", $adsBytes)
+                    Write-Log "Taskbar pin : IconLocation repointed + ADS re-embedded ($($adsBytes.Length) bytes)" -Level Debug
+                }
             }
         }
+        catch { Write-Log "Taskbar pin : failed to update IconLocation : $($_.Exception.Message)" -Level Warning }
     }
-    catch { Write-Log "Taskbar pin : failed to update IconLocation : $($_.Exception.Message)" -Level Warning }
     # Build serialized PIDL blob entry
     $blobEntry = [TaskbarPinHelper]::GetBlobEntryEx($destLnk, $beef001d)
     if (-not $blobEntry) {
@@ -2652,7 +2665,8 @@ function Invoke-TaskbarPin {
     }
     if (-not $blobEntry) {
         Write-Log "Failed to build blob entry for : $destLnk" -Level Error
-        try { [IO.File]::Delete($destLnk) } catch {}
+        # Only clean up a file WE just created : never delete a pre-existing live pin.
+        if (-not $destAlreadyPinned) { try { [IO.File]::Delete($destLnk) } catch {} }
         return $false
     }
     # Inject into registry Favorites blob
@@ -2996,6 +3010,11 @@ function Update-PinButtonState {
             $alreadyPinned = [IO.File]::Exists([IO.Path]::Combine($taskBarDir, $script:LastPinnedTaskbarFile))
         }
         $btnPin.Text = if ($alreadyPinned) { [char]0x2714 + " Pinned" } else { "Pin to Taskbar" }
+        # Lock the button while pinned : re-clicking can only re-pin (never unpin) and
+        # re-pinning a live item risks corrupting it. Unpin from the taskbar instead --
+        # editing the target/name or an external unpin re-enables the button (the
+        # form's Activated handler refreshes this state on focus).
+        if ($alreadyPinned) { $btnPin.Enabled = $false }
     }
     else {
         $btnPin.Text = "Pin to Taskbar"
@@ -4193,6 +4212,8 @@ $btnAbout.Add_Click({
         gen $aboutForm "Panel" "" 20 160 340 2 "BorderStyle=FixedSingle" | Out-Null
         gen $aboutForm "Label" "Changelog :" 20 174 0 0 "Font=Arial, 10, Bold" "AutoSize=$true" "ForeColor=$fgCol" | Out-Null
         $aboutFormText = @"
+$([char]0x2022)  v1.2 : Fix pin already pinned
+
 $([char]0x2022)  v1.1 : Live DPI rescaling - UI polish
           Taskbar pin improvements
           New Control Panels selector
@@ -5428,7 +5449,6 @@ $btnPin.Add_Click({
         $success = Invoke-TaskbarPin $lnkToPin
         if ($success) {
             Write-Log "Taskbar pin successful : $lnkToPin"
-            Update-PinButtonState
         }
         else {
             [System.Windows.Forms.MessageBox]::Show(
@@ -5446,9 +5466,11 @@ $btnPin.Add_Click({
         if ($tempLnkCreated -and $lnkToPin -and [IO.File]::Exists($lnkToPin)) {
             try { [IO.File]::Delete($lnkToPin) } catch {}
         }
-        $btnPin.Enabled = $true
         $form.UseWaitCursor = $false
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        # Let the state helper set the final button state : it disables the button when
+        # the item ended up pinned, and re-enables it otherwise (e.g. on a failed pin).
+        Update-PinButtonState
     }
 })
 
