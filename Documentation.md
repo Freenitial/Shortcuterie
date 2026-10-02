@@ -39,7 +39,7 @@ This document explains the techniques used by Shortcuterie to embed icons inside
 The entire technique hinges on a single line:
 
 ```csharp
-link.SetIconLocation(lnkPath + ":icon.ico", 0);
+link.SetIconLocation(lnkPath + ":" + IconStreamName(icoBytes), 0);   // "MyApp.lnk:icon-3F2A9C1D.ico"
 ```
 
 `IShellLink::SetIconLocation` stores a path string in the .lnk file's StringData section. Windows Shell does not validate whether this path refers to a standalone file - it passes the string directly to `CreateFileW` during icon resolution.
@@ -47,10 +47,10 @@ link.SetIconLocation(lnkPath + ":icon.ico", 0);
 `CreateFileW` natively understands NTFS Alternate Data Stream syntax:
 
 ```
-C:\Users\John\Desktop\MyApp.lnk:icon.ico
+C:\Users\John\Desktop\MyApp.lnk:icon-3F2A9C1D.ico
 ```
 
-The colon-separated `:icon.ico` suffix tells the NTFS driver to open a named data stream attached to the file, rather than the file's default `$DATA` stream. This is resolved at the filesystem driver level.
+The colon-separated `:icon-3F2A9C1D.ico` suffix tells the NTFS driver to open a named data stream attached to the file, rather than the file's default `$DATA` stream. This is resolved at the filesystem driver level.
 
 ### Writing the ADS Payload
 
@@ -73,7 +73,7 @@ Key implementation details:
 
 - **`CREATE_ALWAYS` disposition**: Creates the stream if absent, truncates if it already exists. Idempotent - safe to call repeatedly.
 - **`dwShareMode = 0`**: Exclusive lock during write prevents race conditions with Explorer's icon cache reading the stream concurrently.
-- **Stream name `icon.ico`**: Arbitrary. The `.ico` extension is cosmetic and has no functional impact. The stream name simply needs to match what `SetIconLocation` wrote.
+- **Stream name `icon-XXXXXXXX.ico`**: Derived from the icon's bytes (a 32-bit FNV-1a hash). Explorer caches icons by location, so a changed icon gets a new name and shows at once, without clearing the icon cache. The `.ico` extension is cosmetic; the stream name simply needs to match what `SetIconLocation` wrote.
 - **Invisibility**: ADS data does not appear in `dir`, Explorer file size, or most file managers. Only `dir /r`, Sysinternals Streams, or forensic tools reveal it.
 
 ### Windows Shell Icon Resolution Pipeline
@@ -83,10 +83,10 @@ When Explorer needs to render a shortcut's icon:
 ```
 Explorer
   → SHGetFileInfo / IExtractIcon
-    → IShellLink::GetIconLocation → returns "file.lnk:icon.ico", index 0
+    → IShellLink::GetIconLocation → returns "file.lnk:icon-XXXXXXXX.ico", index 0
       → Icon cache lookup (iconcache_*.db)
-        → Cache miss → PrivateExtractIcons("file.lnk:icon.ico", 0, ...)
-          → CreateFileW("file.lnk:icon.ico", GENERIC_READ, ...)
+        → Cache miss → PrivateExtractIcons("file.lnk:icon-XXXXXXXX.ico", 0, ...)
+          → CreateFileW("file.lnk:icon-XXXXXXXX.ico", GENERIC_READ, ...)
             → NTFS driver opens the ADS
               → Returns valid ICO byte stream → parsed and rendered
 ```
@@ -132,7 +132,9 @@ Offset    Size       Field
 12        4 bytes    Absolute offset to image data
 ```
 
-Shortcuterie generates all 7 standard sizes (16, 24, 32, 48, 64, 128, 256px) as **PNG-compressed** entries inside the ICO container. This is the modern ICO format supported since Windows Vista. Older BMP-based entries would also work but are significantly larger.
+Shortcuterie generates all 7 standard sizes (16, 24, 32, 48, 64, 128, 256px) as **PNG-compressed** entries inside the ICO container. This is the modern ICO format supported since Windows Vista. Older BMP-based entries would also work but are significantly larger. An image that is not square keeps its proportions, centred on a transparent square.
+
+An existing ICO - a `.ico` file, or the Base64 of one, such as the icon imported from a shortcut - is embedded as it is, keeping every size it was drawn at.
 
 ### PE Resource Table Extraction
 
@@ -156,16 +158,19 @@ Offset    Size       Field
 
 Each 14-byte GRPICONDIRENTRY contains `width`, `height`, and a resource ID that maps to an `RT_ICON` resource.
 
-When PE table reading fails (access denied, corrupted resources, negative resource IDs), `BuildFromExecutableEx` falls back to probing `PrivateExtractIcons` at standard sizes in descending order, stopping when it detects upscaled duplicates.
+A negative index is a resource ID (`shell32.dll,-16`): its group is found by that ID in the same table, with every native size up to 256px.
+
+When PE table reading fails (access denied, corrupted resources), `BuildFromExecutableEx` falls back to probing `PrivateExtractIcons` at the standard sizes from 16 to 256px, stopping at the first upscaled duplicate.
 
 ### Multi-Source Build Pipeline
 
 | Source | Method | Flow |
 |--------|--------|------|
 | Bitmap / PNG / JPG | `BuildFromBitmap` | Scale to 7 sizes → PNG-compress each → assemble ICO |
-| Base64 string | `BuildFromBase64` | Decode → detect ICO vs image → extract largest entry or load bitmap → `BuildFromBitmap` |
+| .ico file | - | Kept as it is (every size it was drawn at) |
+| Base64 string | `BuildFromBase64` | Decode → an ICO is kept as it is, another image goes to `BuildFromBitmap` |
 | Executable (PE) | `BuildFromExecutable` | Read PE resource table → extract each native size → assemble ICO |
-| Executable (fallback) | `BuildFromExecutableEx` | Probe PrivateExtractIcons at 256→16 → assemble ICO |
+| Executable (fallback) | `BuildFromExecutableEx` | Probe PrivateExtractIcons from 16 to 256px → assemble ICO |
 | Shell item (UWP/CLSID) | PIDL → SHGetImageList | Extract JUMBO bitmap from system image list → `BuildFromBitmap` |
 
 ---
@@ -193,7 +198,7 @@ Shortcut files follow the [MS-SHLLINK](https://docs.microsoft.com/en-us/openspec
 └─────────────────────────┘
 ```
 
-The icon location string (e.g., `C:\path\file.lnk:icon.ico`) is stored in the **StringData** section. `IShellLink::SetIconLocation` writes this string, and `IPersistFile::Save` serializes the entire structure to disk.
+The icon location string (e.g., `C:\path\file.lnk:icon-XXXXXXXX.ico`) is stored in the **StringData** section. `IShellLink::SetIconLocation` writes this string, and `IPersistFile::Save` serializes the entire structure to disk.
 
 ### IShellLink COM Interface
 
@@ -213,7 +218,7 @@ For existing shortcuts (`UpdateIconOnly`), the approach is:
 
 ```csharp
 ((IPersistFile)link).Load(lnkPath, 0);          // Deserialize
-link.SetIconLocation(lnkPath + ":icon.ico", 0); // Overwrite icon only
+link.SetIconLocation(lnkPath + ":icon-XXXXXXXX.ico", 0); // Overwrite icon only
 ((IPersistFile)link).Save(lnkPath, true);        // Re-serialize
 ```
 
@@ -330,13 +335,15 @@ Refer to this project : https://github.com/Freenitial/Pin-Taskbar
 
 | Concern | Behavior |
 |---------|----------|
-| **Non-NTFS drive (FAT, Cloud...)** | ADS doesn't exist. Icon is silently stripped when copying. Shortcuterie probes with a test write before creation and warns the user. |
+| **Non-NTFS drive (FAT, Cloud...)** | ADS exists on NTFS and ReFS only. On FAT, exFAT and some cloud folders the icon is silently stripped when copying. Shortcuterie probes the destination folder with a test write before creation and warns the user. |
 | **Copy to ZIP/archive** | ADS is stripped by all archive formats. The .lnk becomes icon-less. |
 | **IPersistFile::Save destroys ADS** | Every COM save rewrites the default stream, which erases any existing ADS. Shortcuterie always writes the ADS *after* saving the .lnk. |
-| **Icon cache staleness** | Explorer caches icons aggressively. Updating an existing shortcut's ADS icon may require `ie4uinit.exe -show` or deleting `iconcache_*.db`. |
-| **Explorer Properties dialog** | Shows the self-referencing `file.lnk:icon.ico` path in the icon field. Functional but looks unusual to users. |
-| **Target + Args > 260 chars** | Explorer's property sheet truncates the combined string, making it uneditable via Properties. The shortcut itself works fine - `CreateProcess` supports 32,767 chars. |
-| **Negative icon resource IDs** | Some executables use resource IDs (negative integers) instead of sequential indices. `BuildFromExecutableEx` handles this by probing `PrivateExtractIcons` directly. |
+| **Icon cache** | Explorer caches icons by location. Each icon is stored under a name derived from its content, so an updated icon has a new location and shows at once. |
+| **Explorer Properties dialog** | Shows the self-referencing `file.lnk:icon-XXXXXXXX.ico` path in the icon field. Functional but looks unusual to users. |
+| **Field lengths** | A shortcut keeps at most 259 characters of target, working directory and icon location, and 260 of comment. Shortcuterie enforces these limits; an embedded icon's location (shortcut path + `:icon-XXXXXXXX.ico`) caps the shortcut path at 241 characters. |
+| **Target + Args > 259 chars** | Explorer's property sheet truncates the combined string, making it uneditable via Properties. The shortcut itself works fine - `CreateProcess` supports 32,767 chars. |
+| **Negative icon resource IDs** | Some icon references use resource IDs (negative integers) instead of sequential indices. They are read from the PE resource table by their ID, with every native size. |
+| **URL shortcuts (.url)** | Written and read through Windows' Internet Shortcut object, which keeps characters outside the ANSI code page in the file's Unicode section. A .url references its icon file, so only an .ico, .exe or .dll can be its icon. |
 | **Elevated processes (admin)** | UIPI blocks OLE drag-drop from non-elevated Explorer. Shortcuterie falls back to `WM_DROPFILES` via `ChangeWindowMessageFilterEx`. |
 
 ---

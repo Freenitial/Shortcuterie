@@ -1,5 +1,5 @@
 <# :
-    @echo off & Title Shortcuterie
+    @echo off & setlocal & Title Shortcuterie
 
     :: Windows version check (requires Windows 7 or later)
     for /f "tokens=2 delims=[]" %%v in ('ver') do for /f "tokens=2,3 delims=. " %%m in ("%%v") do (set "WINMAJOR=%%m" & set "WINMINOR=%%n")
@@ -11,7 +11,10 @@
     pause
     exit /b 1
     :winVersionOk
-    
+
+    :: The script's path reaches PowerShell through the environment : as a quoted literal,
+    :: an apostrophe in a folder name ("Outils d'admin") would end the string.
+    set "SHORTCUTERIE_BAT=%~f0"
     powershell -NoLogo -NoProfile -STA -Window Hidden -Command ^
         ^
         %= Create loading popup =% ^
@@ -60,14 +63,14 @@
         "20,42,390,24,$hw,[IntPtr]::Zero,[IntPtr]::Zero,[IntPtr]::Zero);" ^
         ^
         %= PowerShell self-read, skipping batch part =% ^
-        "$batFile='%~f0';& ([ScriptBlock]::Create([IO.File]::ReadAllText('%~f0')))"
+        "$batFile=$env:SHORTCUTERIE_BAT;& ([ScriptBlock]::Create([IO.File]::ReadAllText($batFile)))"
     exit /b
 #>
 
 #region ── VERSION & PATHS ─
 
 $script:AppName       = "Shortcuterie"
-$script:Version       = [version]"1.2"
+$script:Version       = [version]"1.3"
 
 # ---- Remaining functions for Invoke-LoadingPump + updates ----
 $t=$d.DefineType('E','Public,Class')
@@ -91,16 +94,29 @@ $script:LnkName       = "$($script:AppName).lnk"
 $script:TaskbarPinDir = [IO.Path]::Combine($env:APPDATA, "Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar")
 $script:StartMenuDir  = [Environment]::GetFolderPath("Programs")
 
-#region ── ASSEMBLIES & DPI ─
+#region ── ASSEMBLIES, C# TYPES & DPI ─
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# DPI awareness must be set before creating any window
-if (-not ('DPIAware' -as [type])) {
-    Add-Type -TypeDefinition @'
+# Every C# type in one compilation : each Add-Type runs the compiler once (about 150 ms).
+# DPI awareness must be set before creating any window.
+if (-not ('TaskbarPinHelper' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Drawing.dll, System.Windows.Forms.dll -TypeDefinition @'
 using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
+using System.Windows.Forms;
+using Microsoft.Win32.SafeHandles;
+
+// ════ DPI AWARENESS ════
+
 public class DPIAware
 {
     // Modern DPI awareness contexts (Windows 10 1703+)
@@ -114,74 +130,17 @@ public class DPIAware
     // Legacy API fallback (Windows Vista+)
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool SetProcessDPIAware();
-    // Try modern API first, then legacy
+    // Try modern API first, then legacy : before Windows 10 1703 the modern API does not
+    // exist and its call throws, so the legacy call must not depend on it returning.
     public static void SetDpiAwareness(IntPtr context)
     {
-        if (!NativeSetProcessDpiAwarenessContext(context))
-        {
-            SetProcessDPIAware();
-        }
+        try { if (NativeSetProcessDpiAwarenessContext(context)) return; }
+        catch (EntryPointNotFoundException) { }
+        SetProcessDPIAware();
     }
 }
-'@
-}
-try {[System.Windows.Forms.Application]::EnableVisualStyles()}      catch {}
-try {[DPIAware]::SetDpiAwareness([DPIAware]::PER_MONITOR_AWARE_V2)} catch {}
 
-function Get-DisplayPrimaryScaling {
-    $VistaAndMore = [Environment]::OSVersion.Version.Major -ge 6
-    if (-not $VistaAndMore) {
-        try {
-            $val = Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontDPI' -ErrorAction Stop
-            if ($val -and $val.LogPixels -is [int] -and $val.LogPixels -gt 0) {return [math]::Round($val.LogPixels/96.0,2)}
-        } catch { return 1.0 }
-    }
-    else {
-        if (-not ('DPIHelper' -as [type])) {
-        Add-Type @'
-using System;
-using System.Runtime.InteropServices;
-using System.Drawing;
-public static class DPIHelper {
-    [DllImport("gdi32.dll")] static extern int GetDeviceCaps(IntPtr hdc, int nIndex);
-    public enum DeviceCap { VERTRES = 10, DESKTOPVERTRES = 117, LOGPIXELSX = 88 }
-    public static float GetScaling() {
-        using (Graphics g = Graphics.FromHwnd(IntPtr.Zero)) {
-            IntPtr hdc = g.GetHdc();
-            try {
-                int dpi = GetDeviceCaps(hdc, (int)DeviceCap.LOGPIXELSX);
-                if (dpi > 0) { return (float)dpi / 96.0f; }
-                int logical  = GetDeviceCaps(hdc, (int)DeviceCap.VERTRES);
-                int physical = GetDeviceCaps(hdc, (int)DeviceCap.DESKTOPVERTRES);
-                if (logical > 0 && physical > 0) { return (float)physical / (float)logical; }
-                return 1.0f;
-            } finally { g.ReleaseHdc(hdc); }
-        }
-    }
-}
-'@ -ReferencedAssemblies System.Drawing.dll
-        }
-    return [DPIHelper]::GetScaling()
-    }
-}
-$script:DPI_Factor = Get-DisplayPrimaryScaling
-$script:StartupDpiFactor = $script:DPI_Factor
-write-host "DPI = $script:DPI_Factor"
-
-$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-
-#region ── C# TYPES : TASKBAR / ICO / SHORTCUT ─
-
-Add-Type -Language CSharp -ReferencedAssemblies System.Drawing -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.ComTypes;
-using System.Text;
+// ════ TASKBAR / ICO / SHORTCUT ════
 
 // ── Taskbar AppUserModelID ──
 public static class TaskBarHelper
@@ -227,12 +186,14 @@ public static class IcoBuilder
         for (int i = 0; i < arr.Length; i++) parts[i] = arr[i].ToString();
         return string.Join(",", parts);
     }
-    // Build a multi-size ICO byte array from a Bitmap (upscale to all standard sizes)
+    // Build a multi-size ICO byte array from a Bitmap (upscale to all standard sizes) ; a
+    // non-square image keeps its proportions, centred on a transparent square
     public static byte[] BuildFromBitmap(Bitmap source)
     {
         _lastDiagnostic = "BuildFromBitmap : source " + source.Width + "x" + source.Height;
         List<byte[]> pngEntries = new List<byte[]>();
         List<int> entrySizes = new List<int>();
+        int longest = Math.Max(1, Math.Max(source.Width, source.Height));
         foreach (int sz in StandardSizes)
         {
             Bitmap bmp = new Bitmap(sz, sz, PixelFormat.Format32bppArgb);
@@ -246,7 +207,8 @@ public static class IcoBuilder
                     g.SmoothingMode      = SmoothingMode.HighQuality;
                     g.PixelOffsetMode    = PixelOffsetMode.HighQuality;
                     g.CompositingQuality = CompositingQuality.HighQuality;
-                    g.DrawImage(source, 0, 0, sz, sz);
+                    float w = (float)sz * source.Width / longest, h = (float)sz * source.Height / longest;
+                    g.DrawImage(source, (sz - w) / 2f, (sz - h) / 2f, w, h);
                 }
                 finally { g.Dispose(); }
                 MemoryStream ms = new MemoryStream();
@@ -401,7 +363,8 @@ public static class IcoBuilder
         }
         return null;
     }
-    // Read native icon sizes from the PE resource table (RT_GROUP_ICON)
+    // Read native icon sizes from the PE resource table (RT_GROUP_ICON) ; a negative index
+    // is a resource ID ("shell32.dll,-16"), as for PrivateExtractIcons
     public static int[] GetNativeSizes(string exePath, int iconIndex)
     {
         List<int> sizes = new List<int>();
@@ -419,7 +382,8 @@ public static class IcoBuilder
             // Capture hModule in a local for the delegate closure
             IntPtr hMod = hModule;
             EnumResNameProc callback = delegate(IntPtr hModule2, IntPtr lpType2, IntPtr lpName, IntPtr lParam) {
-                if (currentGroupIndex != iconIndex) { currentGroupIndex++; return true; }
+                if (iconIndex < 0) { if (lpName != (IntPtr)(-iconIndex)) return true; }
+                else if (currentGroupIndex != iconIndex) { currentGroupIndex++; return true; }
                 IntPtr hRes = FindResource(hMod, lpName, (IntPtr)14);
                 if (hRes == IntPtr.Zero) { callbackError = "FindResource failed"; return false; }
                 IntPtr hResData = LoadResource(hMod, hRes);
@@ -449,6 +413,11 @@ public static class IcoBuilder
                 _lastDiagnostic = "GetNativeSizes[PE] : " + callbackError + " for group " + iconIndex;
                 return sizes.ToArray();
             }
+            if (sizes.Count == 0 && iconIndex < 0)
+            {
+                _lastDiagnostic = "GetNativeSizes[PE] : resource ID " + (-iconIndex) + " not found";
+                return sizes.ToArray();
+            }
             if (sizes.Count == 0 && currentGroupIndex < iconIndex)
             {
                 _lastDiagnostic = "GetNativeSizes[PE] : iconIndex " + iconIndex
@@ -474,6 +443,21 @@ public static class IcoBuilder
         }
         _lastDiagnostic = "GetMaxNativeSize : no sizes found, defaulting to 48px | " + _lastDiagnostic;
         return 48;
+    }
+    // True for an ICO file whose directory entries all lie inside it : such a file is embedded
+    // as it is, with every size it was drawn at
+    public static bool IsValidIco(byte[] data)
+    {
+        if (data == null || data.Length < 22 || data[0] != 0 || data[1] != 0 || data[2] != 1 || data[3] != 0) return false;
+        int count = BitConverter.ToUInt16(data, 4);
+        if (count == 0 || 6 + 16 * count > data.Length) return false;
+        for (int i = 0; i < count; i++)
+        {
+            int entry = 6 + 16 * i;
+            long size = BitConverter.ToUInt32(data, entry + 8), offset = BitConverter.ToUInt32(data, entry + 12);
+            if (size == 0 || offset < 6 + 16 * count || offset + size > data.Length) return false;
+        }
+        return true;
     }
     // Return the number of icon resources inside an executable
     public static int GetIconCount(string exePath)
@@ -614,7 +598,7 @@ public static class ShortcutHelper
         IShellLink link = (IShellLink)new ShellLink();
         link.SetPath(targetPath);
         link.SetArguments(arguments == null ? "" : arguments);
-        link.SetIconLocation(lnkPath + ":icon.ico", 0);
+        link.SetIconLocation(lnkPath + ":" + IconStreamName(icoBytes), 0);
         link.SetDescription(description == null ? "" : description);
         if (!string.IsNullOrEmpty(workDir)) link.SetWorkingDirectory(workDir);
         ApplyAppId(link, appId);
@@ -635,11 +619,21 @@ public static class ShortcutHelper
         ApplyAppId(link, appId);
         ((IPersistFile)link).Save(lnkPath, true);
     }
-    public static void UpdateIconOnly(string lnkPath)
+    // A new icon gets a new icon location : the shell caches icons by location.
+    public static string IconStreamName(byte[] icoBytes)
+    {
+        uint hash = 2166136261;
+        foreach (byte b in icoBytes) { hash ^= b; hash *= 16777619; }
+        return "icon-" + hash.ToString("X8") + ".ico";
+    }
+    public static void UpdateIconOnly(string lnkPath, string iconLocation)
     {
         IShellLink link = (IShellLink)new ShellLink();
         ((IPersistFile)link).Load(lnkPath, 0);
-        link.SetIconLocation(lnkPath + ":icon.ico", 0);
+        StringBuilder sb = new StringBuilder(260);
+        int index;
+        link.GetIconLocation(sb, sb.Capacity, out index);
+        link.SetIconLocation(iconLocation, index);
         ((IPersistFile)link).Save(lnkPath, true);
     }
     public static string GetDescription(string lnkPath)
@@ -744,7 +738,7 @@ public static class ShortcutHelper
         IShellLink link = (IShellLink)new ShellLink();
         link.SetIDList(pidl);
         CoTaskMemFree(pidl);
-        link.SetIconLocation(lnkPath + ":icon.ico", 0);
+        link.SetIconLocation(lnkPath + ":" + IconStreamName(icoBytes), 0);
         link.SetDescription(description == null ? "" : description);
         ApplyAppId(link, appId);
         ((IPersistFile)link).Save(lnkPath, true);
@@ -763,165 +757,51 @@ public static class ShortcutHelper
         ApplyAppId(link, appId);
         ((IPersistFile)link).Save(lnkPath, true);
     }
-}
-'@
-[TaskBarHelper]::SetAppId($script:AppId)
-
-#region ── ICON ─
-
-$iconBase64 = ""
-if ([string]::IsNullOrEmpty($iconBase64)) {
-    $bmp = New-Object System.Drawing.Bitmap(96, 96)
-    $bmp.SetResolution(96, 96)
-    $g   = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.Clear([System.Drawing.Color]::FromArgb(0, 120, 212))
-    $f  = New-Object System.Drawing.Font("Segoe UI", 72, [System.Drawing.FontStyle]::Bold)
-    $sf = New-Object System.Drawing.StringFormat
-    $sf.Alignment = $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-    $g.DrawString("S", $f, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0, 0, 96, 96)), $sf)
-    $f.Dispose(); $sf.Dispose(); $g.Dispose()
-    $iconImage = $bmp
-    $script:AppIcoBytes = [IcoBuilder]::BuildFromBitmap($bmp)
-} else {
-    $iconBytes  = [Convert]::FromBase64String($iconBase64)
-    $iconStream = New-Object IO.MemoryStream(,$iconBytes)
-    $iconImage  = [System.Drawing.Image]::FromStream($iconStream)
-    $script:AppIcoBytes = [IcoBuilder]::BuildFromBase64($iconBase64)
-}
-
-#region ── LOGGING ─
-
-$script:LogDir  = [System.IO.Path]::Combine($env:TEMP, $script:AppName)
-if (!([System.IO.Directory]::Exists($script:LogDir))) { [System.IO.Directory]::CreateDirectory($script:LogDir) | Out-Null }
-$script:LogFile = [System.IO.Path]::Combine($script:LogDir, "$($script:AppName)_$(Get-Date -Format 'yyyyMMdd').log")
-if ([System.IO.File]::Exists($script:LogFile)) {
-    [System.IO.File]::AppendAllText($script:LogFile, "`n`n`n------------------------------`n`n`n")
-}
-$logFiles = [System.IO.Directory]::GetFiles($script:LogDir, "*.log")
-if ($logFiles.Count -gt 10) {
-    $sorted = [System.Array]::CreateInstance([System.IO.FileInfo], $logFiles.Count)
-    for ($i = 0; $i -lt $logFiles.Count; $i++) { $sorted[$i] = New-Object System.IO.FileInfo($logFiles[$i]) }
-    [System.Array]::Sort($sorted, [System.Comparison[System.IO.FileInfo]]{ param($a, $b) $b.LastWriteTimeUtc.CompareTo($a.LastWriteTimeUtc) })
-    for ($i = 10; $i -lt $sorted.Count; $i++) { [System.IO.File]::Delete($sorted[$i].FullName) }
-}
-function Write-Log {
-    param([string]$Message, [ValidateSet('Info','Warning','Error','Debug')][string]$Level = 'Info')
-    if ([string]::IsNullOrEmpty($script:LogFile)) { return }
-    $ts  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $msg = "[$ts] [$Level] $Message"
-    switch ($Level) {
-        'Error'   { Write-Host $msg -ForegroundColor Red }
-        'Warning' { Write-Host $msg -ForegroundColor Yellow }
-        'Debug'   { Write-Host $msg -ForegroundColor Gray }
-        default   { Write-Host $msg -ForegroundColor White }
+    // Display name the shell gives a path ("Calculator" for shell:AppsFolder\...!App,
+    // "Local Disk (C:)" for C:\), or null
+    public static string GetShellDisplayName(string shellPath)
+    {
+        IntPtr pidl = ParseShellPath(shellPath);
+        if (pidl == IntPtr.Zero) return null;
+        try
+        {
+            IntPtr pszName;
+            if (SHGetNameFromIDList(pidl, 0, out pszName) != 0 || pszName == IntPtr.Zero) return null;
+            string name = Marshal.PtrToStringUni(pszName);
+            CoTaskMemFree(pszName);
+            return name;
+        }
+        finally { CoTaskMemFree(pidl); }
     }
-    try { [IO.File]::AppendAllText($script:LogFile, "$msg`r`n") } catch {}
-}
-Write-Log "═══ $($script:AppName) v$($script:Version) started ═══"
-Write-Log "PowerShell version : $($PSVersionTable.PSVersion)"
-Write-Log "CLR version : $([Environment]::Version)"
-Write-Log "OS : $([Environment]::OSVersion.VersionString)"
-if ($isAdmin) { Write-Log "Running with administrator privileges" }
-else          { Write-Log "Running without administrator privileges"}
-
-Update-LoadingPopup 20  "Loading..."
-
-#region ── PS2.0 HELPERS ─
-
-# .NET 3.5 does not have [string]::IsNullOrWhiteSpace
-function Test-StringEmpty {
-    param([string]$Value)
-    if ($null -eq $Value) { return $true }
-    return ($Value.Trim().Length -eq 0)
-}
-
-# Check whether the icon source panel has no valid icon selected
-function Test-IconSourceEmpty {
-    if ($radioIcon_TargetDefault.Checked) {
-        return $false
+    // ── Internet shortcuts (.url) ──
+    // Written and read by Windows' own object : characters outside the ANSI code page are
+    // kept in the [InternetShortcut.W] section it maintains next to the ANSI one.
+    [ComImport, Guid("CABB0DA0-DA57-11CF-9974-0020AFD79762"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    private interface IUniformResourceLocatorW {
+        void SetURL([MarshalAs(UnmanagedType.LPWStr)] string pcszURL, int dwInFlags);
+        void GetURL([MarshalAs(UnmanagedType.LPWStr)] out string ppszURL);
     }
-    if ($radioIcon_Base64.Checked) {
-        return (Test-StringEmpty $TextboxIcon_Base64.Text)
+    [ComImport, Guid("FBF23B40-E3F0-101B-8488-00AA003E56F8")] private class InternetShortcut { }
+    public static void CreateUrlShortcut(string urlPath, string url, string iconFile, int iconIndex)
+    {
+        object shortcut = new InternetShortcut();
+        ((IUniformResourceLocatorW)shortcut).SetURL(url, 0);
+        if (!string.IsNullOrEmpty(iconFile)) ((IShellLink)shortcut).SetIconLocation(iconFile, iconIndex);
+        ((IPersistFile)shortcut).Save(urlPath, true);
     }
-    return (Test-StringEmpty (Get-CleanInput $iconPathTextbox.Text))
+    // The URL only : the object reports the icon as a file URL in the ANSI code page, and the
+    // browser's icon for a file that has none, so the script reads the icon from the text.
+    public static string ReadUrlShortcut(string urlPath)
+    {
+        object shortcut = new InternetShortcut();
+        ((IPersistFile)shortcut).Load(urlPath, 0);
+        string url;
+        ((IUniformResourceLocatorW)shortcut).GetURL(out url);
+        return url == null ? "" : url;
+    }
 }
 
-#region ── SCRIPT VARIABLES ─
-
-$script:HitTestPassThruControls = New-Object System.Collections.Generic.List[System.Windows.Forms.Control]
-$script:HitTestNativeWindows    = New-Object System.Collections.ArrayList
-$script:CleanupDone             = $false
-
-$script:UserPinnedStartMenu     = $false
-$script:GroupPadding            = 10
-
-$script:FormBorderPenLight = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200,200,200), 1)
-$script:FormBorderPenDark  = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60,60,60), 1)
-$script:DropZonePen        = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 200, 0), 2)
-$script:GroupBoxBorderPen  = New-Object System.Drawing.Pen([System.Drawing.SystemColors]::ControlDark)
-
-$script:CurrentIconIndex    = 0
-$script:CurrentExeIconCount = 0
-$script:SuppressPreviewUpdate   = $false
-
-$script:AdsProbeCache = @{}
-
-$script:AumidCleanRegex = New-Object System.Text.RegularExpressions.Regex('[^a-zA-Z0-9.\-]', [System.Text.RegularExpressions.RegexOptions]::Compiled)
-$script:AumidLeadDotRegex = New-Object System.Text.RegularExpressions.Regex('^\.+', [System.Text.RegularExpressions.RegexOptions]::Compiled)
-
-$script:LastIconMenuPath  = ""
-$script:BuiltIconMenuPath = $null
-$script:ShellTargetIconCache = $null
-$script:LastPinnedTaskbarFile = ""
-$script:LastPinnedConfigKey   = ""     # target|lnk snapshot from the last taskbar pin
-
-# Shortcut limits (MS-SHLLINK spec)
-$script:MaxTargetPath        = 260
-$script:MaxArgsCreateProcess = 32767
-$script:MaxArgsCmdExe        = 8191
-
-# Supported file extensions
-$script:ImageExtensions      = @('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.ico', '.tiff')
-$script:ExeExtensions        = @('.exe', '.dll', '.ocx', '.cpl', '.scr')
-$script:StandardIconExt      = @('.ico', '.exe', '.dll', '.ocx', '.cpl', '.scr')
-$script:CurrentPreviewBitmap = $null
-$script:ActiveDropZone       = $null
-$script:SuppressAutoFill     = $false
-$script:PreviousTargetText   = ""
-$script:DeclinedSplitText    = $null
-$script:SuppressTargetSplit  = $false
-$script:ArgsFromAutoSplit    = $false
-$script:ShellTargetRegexOpts = [System.Text.RegularExpressions.RegexOptions]::Compiled -bor [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-$script:ShellTargetRegex     = New-Object System.Text.RegularExpressions.Regex('^(::\{|\{[0-9a-fA-F]{8}-|shell:::\{|shell:[a-zA-Z])', $script:ShellTargetRegexOpts)
-$script:IsUrlTarget          = $false
-$script:IsShellTarget        = $false
-$script:UrlTargetRegex       = New-Object System.Text.RegularExpressions.Regex('^[a-zA-Z][a-zA-Z0-9+.\-]*://', $script:ShellTargetRegexOpts)
-$script:ExtSplitRegex        = New-Object System.Text.RegularExpressions.Regex('(?i)\.(exe|bat|cmd|ps1|vbs|com|msi|wsf|scr|cpl)\b', [System.Text.RegularExpressions.RegexOptions]::Compiled)
-$script:ProbeExts = if (-not [string]::IsNullOrEmpty($env:PATHEXT)) {
-    $env:PATHEXT.Split(';') | Where-Object { $_.Length -gt 0 }
-} else {
-    [string[]]@('.exe', '.bat', '.cmd', '.com')
-}
-$script:PathDirs = if (-not [string]::IsNullOrEmpty($env:PATH)) {
-    $env:PATH.Split(';') | Where-Object { $_.Length -gt 0 -and [IO.Directory]::Exists($_) }
-} else {
-    [string[]]@()
-}
-
-# Theme color
-$script:IsDarkMode       = $false
-$script:AboutNormalColor = [System.Drawing.Color]::FromArgb(228, 228, 228)
-$script:AboutHoverColor  = [System.Drawing.Color]::FromArgb(210, 210, 210)
-
-#region ── C# TYPES : FORM & NATIVE ─
-
-Update-LoadingPopup 30  "Loading..."
-
-Add-Type -ReferencedAssemblies System.Windows.Forms.dll, System.Drawing.dll -TypeDefinition @"
-using System;
-using System.Windows.Forms;
-using System.Drawing;
-using System.Runtime.InteropServices;
+// ════ FORM & NATIVE ════
 
 // ── Borderless resizable form with WndProc event ──
 public delegate void WndProcEventHandler(object sender, Message m);
@@ -1040,17 +920,47 @@ public class ScalingCheckBox : CheckBox
     }
 }
 
+// A TextBox that shows a hint while it is empty and unfocused, in a colour the theme picks.
+// The system cue banner (EM_SETCUEBANNER) is drawn in the edit theme's fixed 87,87,87 :
+// darker than the dim labels on a light background, almost invisible on a dark one.
+public class HintTextBox : TextBox
+{
+    [StructLayout(LayoutKind.Sequential)] private struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("user32.dll")] private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, ref RECT lParam);
+    private const int WM_PAINT = 0x000F, EM_GETRECT = 0x00B2;
+    private string _hint = "";
+    private Color _hintColor = Color.Gray;
+    public string Hint { get { return _hint; } set { _hint = value == null ? "" : value; Invalidate(); } }
+    public Color HintColor { get { return _hintColor; } set { _hintColor = value; Invalidate(); } }
+    protected override void WndProc(ref Message m)
+    {
+        base.WndProc(ref m);
+        if (m.Msg != WM_PAINT || TextLength > 0 || _hint.Length == 0 || Focused) return;
+        // Drawn in the edit's own formatting rectangle, where typed text would start
+        RECT r = new RECT();
+        SendMessage(Handle, EM_GETRECT, IntPtr.Zero, ref r);
+        Rectangle area = Rectangle.FromLTRB(r.Left, r.Top, r.Right, r.Bottom);
+        if (area.Width <= 0 || area.Height <= 0) area = ClientRectangle;
+        using (Graphics g = CreateGraphics())
+            TextRenderer.DrawText(g, _hint, Font, area, _hintColor,
+                TextFormatFlags.Left | TextFormatFlags.Top | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+    }
+    protected override void OnGotFocus(EventArgs e) { base.OnGotFocus(e); Invalidate(); }
+    protected override void OnLostFocus(EventArgs e) { base.OnLostFocus(e); Invalidate(); }
+    protected override void OnTextChanged(EventArgs e) { base.OnTextChanged(e); if (TextLength == 0) Invalidate(); }
+}
+
 // ── DWM ROUNDED CORNERS ──
 public static class DwmHelper {
     [DllImport("dwmapi.dll", CharSet=CharSet.Unicode, SetLastError=true)]
-    private static extern long DwmSetWindowAttribute(IntPtr hwnd, uint attr, ref int val, uint sz);
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, uint attr, ref int val, uint sz);
     public static void SetRoundedCorners(Form f) { int v=2; DwmSetWindowAttribute(f.Handle,33,ref v,sizeof(int)); }
 }
 
 // ── Drag-and-drop fix for elevated (admin) processes ──
 public class DragDropFix {
     [DllImport("shell32.dll")] public static extern void DragAcceptFiles(IntPtr hwnd, bool accept);
-    [DllImport("shell32.dll")] public static extern uint DragQueryFile(IntPtr hDrop, uint iFile, [Out] System.Text.StringBuilder lpszFile, uint cch);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)] public static extern uint DragQueryFile(IntPtr hDrop, uint iFile, [Out] System.Text.StringBuilder lpszFile, uint cch);
     [DllImport("shell32.dll")] public static extern void DragFinish(IntPtr hDrop);
     [DllImport("user32.dll")]  public static extern bool ChangeWindowMessageFilterEx(IntPtr hwnd, uint msg, uint action, IntPtr p);
     public static void Enable(IntPtr hwnd) {
@@ -1080,11 +990,7 @@ public class NativeMethods
     [DllImport("uxtheme.dll", CharSet = CharSet.Unicode)] public static extern int SetWindowTheme(IntPtr hwnd, string appName, string idList);
     [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
     [DllImport("user32.dll")]   public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll", SetLastError = true)] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-    [DllImport("user32.dll", SetLastError = true)] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
     public const int SW_HIDE = 0, SW_SHOW = 5;
-    public const int GWL_EXSTYLE = -20;
-    public const int WS_EX_COMPOSITED = 0x02000000;
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern int SendMessageW(IntPtr hWnd, int msg, int wParam, string lParam);
 }
@@ -1098,16 +1004,31 @@ public static class DarkMode
     private static extern bool AllowDarkModeForWindow(IntPtr hwnd, bool allow);
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int val, int size);
-    public static void Init() { try { SetPreferredAppMode(1); } catch { } }
+    // The undocumented uxtheme ordinals exist from Windows 10 1809 (build 17763) : before,
+    // the same numbers can be other functions. #135 is AllowDarkModeForApp(BOOL) in 1809
+    // and SetPreferredAppMode from 1903 (build 18362).
+    private static readonly int Build = ReadBuild();
+    private static int ReadBuild() {
+        try {
+            int build;
+            object value = Microsoft.Win32.Registry.GetValue("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", "CurrentBuildNumber", "0");
+            return int.TryParse(value as string, out build) ? build : 0;
+        } catch { return 0; }
+    }
+    public static void Init() { if (Build < 17763) return; try { SetPreferredAppMode(1); } catch { } }
     // Force the process app mode to match Shortcuterie's OWN dark/light toggle
     // (2 = ForceDark, 3 = ForceLight) so themed scrollbars don't just follow the
     // system theme (AllowDark) and end up light while the app is dark.
-    public static void SetAppMode(bool dark) { try { SetPreferredAppMode(dark ? 2 : 3); } catch { } }
+    public static void SetAppMode(bool dark) {
+        if (Build < 17763) return;
+        try { SetPreferredAppMode(Build >= 18362 ? (dark ? 2 : 3) : (dark ? 1 : 0)); } catch { }
+    }
     public static void ApplyControl(IntPtr hwnd, bool dark) {
+        bool darkTheme = dark && Build >= 17763;
         // AllowDarkModeForWindow is REQUIRED for a ListView (SysListView32) to
         // honour the dark scrollbar theme ; a plain Panel works without it.
-        try { AllowDarkModeForWindow(hwnd, dark); } catch { }
-        NativeMethods.SetWindowTheme(hwnd, dark ? "DarkMode_Explorer" : "Explorer", null);
+        if (Build >= 17763) { try { AllowDarkModeForWindow(hwnd, darkTheme); } catch { } }
+        NativeMethods.SetWindowTheme(hwnd, darkTheme ? "DarkMode_Explorer" : "Explorer", null);
     }
     public static void ApplyWindowFrame(IntPtr hwnd, bool dark) {
         int v = dark ? 1 : 0;
@@ -1115,16 +1036,9 @@ public static class DarkMode
             DwmSetWindowAttribute(hwnd, 19, ref v, sizeof(int));
     }
 }
-"@ -Language CSharp
 
-[DarkMode]::Init()
+// ════ TITLE BAR ════
 
-#region ── C# TYPES : TITLE BAR ─
-
-Update-LoadingPopup 40 "Loading..."
-
-Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -Language CSharp -TypeDefinition @'
-using System; using System.Drawing; using System.Windows.Forms; using System.Runtime.InteropServices;
 public class DoubleBufferedPanel : Panel {
     public DoubleBufferedPanel() { DoubleBuffered = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint|ControlStyles.UserPaint|ControlStyles.OptimizedDoubleBuffer,true); }
@@ -1164,19 +1078,8 @@ public class TitleBarButton : Label {
     protected override void OnMouseLeave(EventArgs e){ base.OnMouseLeave(e);
         BackColor=_normalBack; ForeColor=_normalFore; }
 }
-'@
 
-#region ── C# TYPES : ADS HELPER & ICON RESOLVER ─
-
-Add-Type -ReferencedAssemblies System.Drawing.dll -Language CSharp -TypeDefinition @'
-using System;
-using System.IO;
-using System.Drawing;
-using System.Drawing.Imaging;
-using System.Text;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
+// ════ ADS HELPER & ICON RESOLVER ════
 
 // ── NTFS Alternate Data Stream reader/writer via CreateFileW ──
 public static class AdsHelper
@@ -1224,6 +1127,12 @@ public static class AdsHelper
                 return data;
             }
         }
+    }
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool DeleteFileW(string lpFileName);
+    public static bool DeleteStream(string filePath, string streamName)
+    {
+        return DeleteFileW(filePath + ":" + streamName);
     }
     public static long GetStreamLength(string filePath, string streamName)
     {
@@ -1466,7 +1375,9 @@ public static class IconResolver
             Guid iid = IID_IImageList;
             if (SHGetImageList(listId, ref iid, out imageList) == 0 && imageList != IntPtr.Zero)
             {
+                // SHGetImageList hands over a reference to the system image list
                 IntPtr hIcon = ImageList_GetIcon(imageList, sysIndex, 0);
+                Marshal.Release(imageList);
                 if (hIcon != IntPtr.Zero)
                 {
                     Icon ico = Icon.FromHandle(hIcon);
@@ -1597,6 +1508,7 @@ public static class ShellDropHelper
             if (SHGetImageList(listIds[li], ref iid, out imageList) == 0 && imageList != IntPtr.Zero)
             {
                 IntPtr hIcon = ImageList_GetIcon(imageList, shfi.iIcon, 0);
+                Marshal.Release(imageList);
                 if (hIcon != IntPtr.Zero)
                 {
                     Icon ico = Icon.FromHandle(hIcon);
@@ -1730,13 +1642,8 @@ public static class ShellDropHelper
         finally { ILFree(pidl); }
     }
 }
-'@
 
-#region ── C# TYPE : TASKBAR PIN ─
-
-Add-Type -Language CSharp -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
+// ════ TASKBAR PIN ════
 
 public static class TaskbarPinHelper
 {
@@ -1746,8 +1653,20 @@ public static class TaskbarPinHelper
     private static extern void ILFree(IntPtr pidl);
     [DllImport("shell32.dll")]
     private static extern IntPtr ILFindLastID(IntPtr pidl);
+    [DllImport("shell32.dll")]
+    private static extern IntPtr ILCombine(IntPtr pidl1, IntPtr pidl2);
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern int SHParseDisplayName(string pszName, IntPtr pbc, out IntPtr ppidl, uint sfgaoIn, out uint psfgaoOut);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern int SHCreateItemFromParsingName(string pszPath, IntPtr pbc, ref Guid riid, out IntPtr ppv);
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    private static extern bool SHGetPathFromIDListW(IntPtr pidl, StringBuilder pszPath);
+    [DllImport("shell32.dll")]
+    private static extern int SHGetSpecialFolderLocation(IntPtr hwnd, int csidl, out IntPtr ppidl);
+    [DllImport("shell32.dll")]
+    private static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+    [DllImport("ole32.dll")]
+    private static extern int CoCreateInstance(ref Guid rclsid, IntPtr pUnk, uint ctx, ref Guid riid, out IntPtr ppv);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -1762,40 +1681,458 @@ public static class TaskbarPinHelper
     private static extern bool ReleaseMutex(IntPtr hMutex);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr hObject);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int FnGetAppIDForShortcut(IntPtr p, IntPtr psi, out IntPtr appId);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate uint FnRelease(IntPtr p);
 
-    private static byte[] InjectBeef001D(byte[] item, string displayName)
-    {
-        ushort cb = BitConverter.ToUInt16(item, 0);
-        if (cb < 4) return null;
-        byte[] nameBytes = System.Text.Encoding.Unicode.GetBytes(displayName + "\0");
-        int blockCb = 2 + 2 + 4 + 2 + nameBytes.Length;
-        byte[] block = new byte[blockCb];
-        Array.Copy(BitConverter.GetBytes((ushort)blockCb), 0, block, 0, 2);
-        block[4] = 0x1D; block[5] = 0x00; block[6] = 0xEF; block[7] = 0xBE; block[8] = 0x02; block[9] = 0x00;
-        Array.Copy(nameBytes, 0, block, 10, nameBytes.Length);
-        ushort extOffset = BitConverter.ToUInt16(item, cb - 2);
-        int insertPos;
-        if (extOffset > 4 && extOffset < cb - 4)
-        {
-            int epos = extOffset;
-            while (epos + 8 <= cb)
-            {
-                ushort ecb = BitConverter.ToUInt16(item, epos);
-                if (ecb < 8 || epos + ecb > cb) break;
-                uint esig = BitConverter.ToUInt32(item, epos + 4);
-                if ((esig & 0xFFFF0000) != 0xBEEF0000) break;
-                epos += ecb;
-            }
-            insertPos = epos;
-        }
-        else { insertPos = cb - 2; extOffset = (ushort)insertPos; }
-        int newCb = insertPos + blockCb + 2;
-        byte[] result = new byte[newCb];
-        Array.Copy(item, 0, result, 0, insertPos);
-        Array.Copy(block, 0, result, insertPos, blockCb);
-        Array.Copy(BitConverter.GetBytes(extOffset), 0, result, newCb - 2, 2);
-        Array.Copy(BitConverter.GetBytes((ushort)newCb), 0, result, 0, 2);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int FnQueryInterface(IntPtr p, ref Guid iid, out IntPtr result);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int FnLoadFile(IntPtr p, IntPtr name, uint mode);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] private delegate int FnSetIDList(IntPtr p, IntPtr pidl);
+    private static readonly Guid CLSID_ShellLink = new Guid("00021401-0000-0000-C000-000000000046");
+    private static readonly Guid IID_IShellLinkW = new Guid("000214F9-0000-0000-C000-000000000046");
+    private static readonly Guid IID_IPersistFile = new Guid("0000010B-0000-0000-C000-000000000046");
+    private static T Vtbl<T>(IntPtr table, int slot) where T : class {
+        return (T)(object)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(table, slot * IntPtr.Size), typeof(T));
+    }
+    delegate T StaFunc<T>();
+    static T RunOnSTA<T>(StaFunc<T> fn) {
+        if (System.Threading.Thread.CurrentThread.GetApartmentState() == System.Threading.ApartmentState.STA) return fn();
+        T result = default(T);
+        Exception error = null;
+        System.Threading.Thread staThread = new System.Threading.Thread(delegate() {
+            try { result = fn(); }
+            catch (Exception ex) { error = ex; }
+        });
+        staThread.SetApartmentState(System.Threading.ApartmentState.STA);
+        staThread.Start();
+        staThread.Join();
+        if (error != null) throw new InvalidOperationException("Shell operation failed.", error);
         return result;
+    }
+
+    // Extension block : [cb][version][signature][data][offset of the first block], cb counting that last WORD.
+    private static bool IsBlock(byte[] item, int pos, int cb)
+    {
+        if (pos + 8 > cb) return false;
+        int size = BitConverter.ToUInt16(item, pos);
+        return size >= 8 && pos + size <= cb && BitConverter.ToUInt16(item, pos + 6) == 0xBEEF;
+    }
+
+    private static int FirstBlock(byte[] item, int cb)
+    {
+        if (cb < 12) return 0;
+        int first = BitConverter.ToUInt16(item, cb - 2);
+        if (first < 4 || first >= cb) return 0;
+        int pos = first;
+        while (pos < cb && IsBlock(item, pos, cb)) pos += BitConverter.ToUInt16(item, pos);
+        return pos == cb ? first : 0;
+    }
+
+    private static void Put16(byte[] data, int pos, int value) { data[pos] = (byte)value; data[pos + 1] = (byte)(value >> 8); }
+
+    private static byte[] InjectBeef001D(byte[] item, string appId)
+    {
+        int cb = BitConverter.ToUInt16(item, 0);
+        if (cb < 4 || cb > item.Length) return null;
+        byte[] nameBytes = Encoding.Unicode.GetBytes(appId + "\0");
+        int blockCb = 12 + nameBytes.Length, newCb = cb + blockCb, first = FirstBlock(item, cb);
+        if (first == 0) first = cb;
+        if (newCb > 0xFFFF) return null;
+        byte[] result = new byte[newCb];
+        Array.Copy(item, 0, result, 0, cb);
+        Put16(result, cb, blockCb);
+        Array.Copy(BitConverter.GetBytes(0xBEEF001Du), 0, result, cb + 4, 4);
+        Put16(result, cb + 8, 2);
+        Array.Copy(nameBytes, 0, result, cb + 10, nameBytes.Length);
+        Put16(result, newCb - 2, first);
+        Put16(result, 0, newCb);
+        return result;
+    }
+
+    // The item with its extension blocks back in one chain; null when the chain is whole.
+    private static byte[] RepairItem(byte[] item)
+    {
+        int cb = item.Length;
+        if (cb < 12) return null;
+        int first = BitConverter.ToUInt16(item, cb - 2);
+        if (first < 4 || first >= cb) return null;
+        List<int> starts = new List<int>(), sizes = new List<int>();
+        bool changed = false;
+        int pos = first;
+        while (pos < cb)
+        {
+            if (IsBlock(item, pos, cb)) { starts.Add(pos); sizes.Add(BitConverter.ToUInt16(item, pos)); pos += BitConverter.ToUInt16(item, pos); }
+            else if (starts.Count > 0 && pos + 2 <= cb && BitConverter.ToUInt16(item, pos) == first && (pos + 2 == cb || IsBlock(item, pos + 2, cb))) { sizes[sizes.Count - 1] += 2; pos += 2; changed = true; }
+            else return null;
+        }
+        if (!changed) return null;
+        List<string> seen = new List<string>();
+        List<int> written = new List<int>();
+        MemoryStream ms = new MemoryStream();
+        ms.Write(item, 0, first);
+        for (int i = 0; i < starts.Count; i++)
+        {
+            string content = sizes[i] + ":" + Convert.ToBase64String(item, starts[i] + 2, sizes[i] - 4);
+            if (seen.Contains(content)) continue;
+            seen.Add(content);
+            written.Add((int)ms.Length); written.Add(sizes[i]);
+            ms.Write(item, starts[i], sizes[i]);
+        }
+        byte[] result = ms.ToArray();
+        for (int i = 0; i < written.Count; i += 2) Put16(result, written[i], written[i + 1]);
+        Put16(result, 0, result.Length);
+        return result;
+    }
+
+    private static byte[] WithoutBlock(byte[] item, uint signature)
+    {
+        int cb = item.Length, first = FirstBlock(item, cb);
+        if (first == 0) return item;
+        MemoryStream ms = new MemoryStream();
+        ms.Write(item, 0, first);
+        for (int pos = first; pos < cb; pos += BitConverter.ToUInt16(item, pos))
+        {
+            if (BitConverter.ToUInt32(item, pos + 4) != signature) ms.Write(item, pos, BitConverter.ToUInt16(item, pos));
+        }
+        byte[] result = ms.ToArray();
+        Put16(result, 0, result.Length);
+        return result;
+    }
+
+    private static string ItemAppId(byte[] item)
+    {
+        int cb = item.Length, first = FirstBlock(item, cb);
+        for (int pos = first; first != 0 && pos < cb; pos += BitConverter.ToUInt16(item, pos))
+        {
+            int end = pos + BitConverter.ToUInt16(item, pos);
+            if (BitConverter.ToUInt32(item, pos + 4) != 0xBEEF001D || end < pos + 12) continue;
+            int stop = pos + 10;
+            while (stop + 1 < end && (item[stop] != 0 || item[stop + 1] != 0)) stop += 2;
+            return Encoding.Unicode.GetString(item, pos + 10, stop - pos - 10);
+        }
+        return "";
+    }
+
+    private static int LastItemOffset(byte[] entry)
+    {
+        int pos = 5, last = 0;
+        while (pos + 2 <= entry.Length)
+        {
+            int size = BitConverter.ToUInt16(entry, pos);
+            if (size == 0) break;
+            if (size < 2 || pos + size > entry.Length) return 0;
+            last = pos; pos += size;
+        }
+        return last;
+    }
+
+    private static byte[] LastItem(byte[] entry, int last)
+    {
+        byte[] item = new byte[BitConverter.ToUInt16(entry, last)];
+        Array.Copy(entry, last, item, 0, item.Length);
+        return item;
+    }
+
+    private static byte[] WithLastItem(byte[] entry, int last, byte[] item)
+    {
+        int pidlSize = (last - 5) + item.Length + 2;
+        byte[] result = new byte[5 + pidlSize];
+        Array.Copy(entry, 0, result, 0, last);
+        Array.Copy(BitConverter.GetBytes((uint)pidlSize), 0, result, 1, 4);
+        Array.Copy(item, 0, result, last, item.Length);
+        return result;
+    }
+
+    public static string GetEntryAppId(byte[] entry)
+    {
+        int last = LastItemOffset(entry);
+        if (last == 0) return "";
+        byte[] item = LastItem(entry, last);
+        byte[] repaired = RepairItem(item);
+        return ItemAppId(repaired != null ? repaired : item);
+    }
+
+    // The entry repaired and holding appId; null when unchanged.
+    public static byte[] FixEntry(byte[] entry, string appId)
+    {
+        int last = LastItemOffset(entry);
+        if (last == 0) return null;
+        byte[] item = LastItem(entry, last);
+        bool changed = false;
+        byte[] repaired = RepairItem(item);
+        if (repaired != null) { item = repaired; changed = true; }
+        if (!string.IsNullOrEmpty(appId) && !string.Equals(ItemAppId(item), appId, StringComparison.OrdinalIgnoreCase))
+        {
+            byte[] injected = InjectBeef001D(WithoutBlock(item, 0xBEEF001D), appId);
+            if (injected != null) { item = injected; changed = true; }
+        }
+        return changed ? WithLastItem(entry, last, item) : null;
+    }
+
+    public static string GetEntryPath(byte[] entry)
+    {
+        if (entry == null || entry.Length < 7) return "";
+        int size = (int)BitConverter.ToUInt32(entry, 1);
+        if (size < 2 || 5 + size > entry.Length) return "";
+        IntPtr pidl = Marshal.AllocCoTaskMem(size + 2), root = IntPtr.Zero, full = IntPtr.Zero;
+        try
+        {
+            Marshal.Copy(entry, 5, pidl, size);
+            Marshal.WriteInt16(pidl, size, 0);
+            IntPtr absolute = pidl;
+            if (entry[0] != 0)
+            {
+                if (SHGetSpecialFolderLocation(IntPtr.Zero, entry[0], out root) != 0) return "";
+                full = ILCombine(root, pidl);
+                if (full == IntPtr.Zero) return "";
+                absolute = full;
+            }
+            StringBuilder path = new StringBuilder(1024);
+            return SHGetPathFromIDListW(absolute, path) ? path.ToString() : "";
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(pidl);
+            if (root != IntPtr.Zero) ILFree(root);
+            if (full != IntPtr.Zero) ILFree(full);
+        }
+    }
+
+    static System.Collections.Generic.List<byte[]> SplitFavorites(byte[] blob) {
+        System.Collections.Generic.List<byte[]> entries = new System.Collections.Generic.List<byte[]>();
+        if (blob == null || blob.Length == 0) return entries;
+        int pos = 0;
+        while (pos < blob.Length && blob[pos] != 0xFF) {
+            if (pos + 5 > blob.Length) throw new InvalidOperationException("Truncated Favorites entry.");
+            uint size = BitConverter.ToUInt32(blob, pos + 1);
+            if (size < 2 || size > (long)blob.Length - pos - 5)
+                throw new InvalidOperationException("Invalid Favorites entry size.");
+            int total = 5 + (int)size;
+            int item = pos + 5, end = pos + total;
+            while (item + 2 <= end && BitConverter.ToUInt16(blob, item) != 0) {
+                int cb = BitConverter.ToUInt16(blob, item);
+                if (cb < 2 || cb > end - item) throw new InvalidOperationException("Invalid Favorites PIDL.");
+                item += cb;
+            }
+            if (item + 2 != end || BitConverter.ToUInt16(blob, item) != 0)
+                throw new InvalidOperationException("Invalid Favorites PIDL terminator.");
+            byte[] entry = new byte[total];
+            Array.Copy(blob, pos, entry, 0, total);
+            entries.Add(entry);
+            pos += total;
+        }
+        if (pos != blob.Length - 1 || blob[pos] != 0xFF)
+            throw new InvalidOperationException("Invalid Favorites list terminator.");
+        return entries;
+    }
+
+    private static byte[] JoinFavorites(List<byte[]> entries)
+    {
+        MemoryStream ms = new MemoryStream();
+        foreach (byte[] entry in entries) ms.Write(entry, 0, entry.Length);
+        ms.WriteByte(0xFF);
+        return ms.ToArray();
+    }
+
+    public static int CountEntries(byte[] blob) { return SplitFavorites(blob).Count; }
+
+    public static byte[] GetEntry(byte[] blob, int index)
+    {
+        List<byte[]> entries = SplitFavorites(blob);
+        return index >= 0 && index < entries.Count ? entries[index] : null;
+    }
+
+    public static byte[] ReplaceEntry(byte[] blob, int index, byte[] entry)
+    {
+        List<byte[]> entries = SplitFavorites(blob);
+        entries[index] = entry;
+        return JoinFavorites(entries);
+    }
+
+    public static byte[] AppendEntry(byte[] blob, byte[] entry)
+    {
+        List<byte[]> entries = SplitFavorites(blob);
+        entries.Add(entry);
+        return JoinFavorites(entries);
+    }
+
+    public static int FindEntryByAppId(byte[] blob, string appId) {
+        if (string.IsNullOrEmpty(appId)) return -1;
+        List<byte[]> entries = SplitFavorites(blob);
+        int retired = -1;
+        for (int i = 0; i < entries.Count; i++) {
+            if (!string.Equals(GetEntryAppId(entries[i]), appId, StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsRetiredEntry(entries[i])) return i;
+            if (retired < 0) retired = i;
+        }
+        return retired;
+    }
+
+    // Same path, else same file name; an active entry before a retired one (BEEF002C).
+    public static int FindEntryByPath(byte[] blob, string lnkPath)
+    {
+        List<byte[]> entries = SplitFavorites(blob);
+        string fileName = Path.GetFileName(lnkPath);
+        int bestIndex = -1, bestRank = 4;
+        for (int i = 0; i < entries.Count; i++)
+        {
+            string entryPath = GetEntryPath(entries[i]);
+            int rank;
+            if (string.Equals(entryPath, lnkPath, StringComparison.OrdinalIgnoreCase)) rank = 0;
+            else if (entryPath.Length > 0 && string.Equals(Path.GetFileName(entryPath), fileName, StringComparison.OrdinalIgnoreCase)) rank = 1;
+            else continue;
+            if (IsRetiredEntry(entries[i])) rank += 2;
+            if (rank < bestRank) { bestIndex = i; bestRank = rank; }
+        }
+        return bestIndex;
+    }
+
+    static System.Collections.Generic.List<byte[]> SplitResolve(byte[] blob) {
+        System.Collections.Generic.List<byte[]> records = new System.Collections.Generic.List<byte[]>();
+        int pos = 0;
+        while (blob != null && pos < blob.Length) {
+            if (pos + 4 > blob.Length) throw new InvalidOperationException("Truncated FavoritesResolve record.");
+            uint linkSize = BitConverter.ToUInt32(blob, pos);
+            if (linkSize > (long)blob.Length - pos - 4)
+                throw new InvalidOperationException("Invalid FavoritesResolve record size.");
+            byte[] record = new byte[4 + (int)linkSize];
+            Array.Copy(blob, pos, record, 0, record.Length);
+            records.Add(record);
+            pos += record.Length;
+        }
+        return records;
+    }
+    static byte[] JoinResolve(List<byte[]> records) {
+        MemoryStream stream = new MemoryStream();
+        foreach (byte[] record in records) stream.Write(record, 0, record.Length);
+        return stream.ToArray();
+    }
+    public static byte[] FitResolve(byte[] blob, int count) {
+        List<byte[]> records = SplitResolve(blob);
+        while (records.Count > count) records.RemoveAt(records.Count - 1);
+        while (records.Count < count) records.Add(new byte[4]);
+        return JoinResolve(records);
+    }
+
+    // FavoritesResolve record : [uint32 size][serialized ShellLink], built as Windows builds it :
+    // a link to the pinned item itself (SLDF_ALLOW_LINK_TO_LINK).
+    public const int RecordFormat = 2;
+    [DllImport("ole32.dll")] static extern int CreateStreamOnHGlobal(IntPtr memory, bool deleteOnRelease, out IntPtr stream);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FnGetFlags(IntPtr p, out uint flags);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FnSetFlags(IntPtr p, uint flags);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FnPersistStreamSave(IntPtr p, IntPtr stream, int clearDirty);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FnStreamSeek(IntPtr p, long offset, uint origin, out long position);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] delegate int FnStreamRead(IntPtr p, [Out] byte[] data, uint count, out uint read);
+    static readonly Guid IID_IShellLinkDataList = new Guid("45E2B4AE-B1C3-11D0-B92F-00A0C90312E1");
+    static readonly Guid IID_IPersistStream = new Guid("00000109-0000-0000-C000-000000000046");
+
+    static void RequireSuccess(int hr) {
+        if (hr < 0) Marshal.ThrowExceptionForHR(hr);
+    }
+    static T Slot<T>(IntPtr comObject, int slot) where T : class { return Vtbl<T>(Marshal.ReadIntPtr(comObject), slot); }
+    static byte[] BuildRecordFromPidl(IntPtr pidl) {
+        Guid cls = CLSID_ShellLink, iid = IID_IShellLinkW;
+        IntPtr link = IntPtr.Zero, dataList = IntPtr.Zero, persist = IntPtr.Zero, stream = IntPtr.Zero;
+        try {
+            RequireSuccess(CoCreateInstance(ref cls, IntPtr.Zero, 1, ref iid, out link));
+            iid = IID_IShellLinkDataList;
+            RequireSuccess(Slot<FnQueryInterface>(link, 0)(link, ref iid, out dataList));
+            uint linkFlags;
+            RequireSuccess(Slot<FnGetFlags>(dataList, 6)(dataList, out linkFlags));
+            RequireSuccess(Slot<FnSetFlags>(dataList, 7)(dataList, linkFlags | 0x00800000));
+            RequireSuccess(Slot<FnSetIDList>(link, 5)(link, pidl));
+            iid = IID_IPersistStream;
+            RequireSuccess(Slot<FnQueryInterface>(link, 0)(link, ref iid, out persist));
+            RequireSuccess(CreateStreamOnHGlobal(IntPtr.Zero, true, out stream));
+            RequireSuccess(Slot<FnPersistStreamSave>(persist, 6)(persist, stream, 1));
+            long size, position; uint read;
+            RequireSuccess(Slot<FnStreamSeek>(stream, 5)(stream, 0, 1, out size));
+            RequireSuccess(Slot<FnStreamSeek>(stream, 5)(stream, 0, 0, out position));
+            byte[] payload = new byte[size];
+            RequireSuccess(Slot<FnStreamRead>(stream, 3)(stream, payload, (uint)size, out read));
+            if (read != size) throw new InvalidOperationException("Incomplete ShellLink serialization.");
+            byte[] record = new byte[4 + size];
+            Array.Copy(BitConverter.GetBytes((uint)size), record, 4);
+            Array.Copy(payload, 0, record, 4, payload.Length);
+            return record;
+        } finally {
+            foreach (IntPtr comObject in new IntPtr[] { stream, persist, dataList, link }) if (comObject != IntPtr.Zero) Release(comObject);
+        }
+    }
+    // True when the record is the ShellLink Windows writes for a pin (SLDF_ALLOW_LINK_TO_LINK).
+    static bool IsWindowsRecord(byte[] record) {
+        return record != null && record.Length >= 4 + 0x4C && BitConverter.ToUInt32(record, 0) == record.Length - 4 &&
+               BitConverter.ToUInt32(record, 4) == 0x4C && (BitConverter.ToUInt32(record, 24) & 0x00800001) == 0x00800001;
+    }
+    public static void ValidateResolveRecord(byte[] record) {
+        if (!IsWindowsRecord(record)) throw new InvalidOperationException("A pin record in Windows' form is required.");
+    }
+    static IntPtr EntryPidl(byte[] entry) {
+        if (entry == null || entry.Length < 7) throw new InvalidOperationException("Invalid Favorites entry.");
+        int size = entry.Length - 5;
+        if (BitConverter.ToUInt32(entry, 1) != size)
+            throw new InvalidOperationException("Invalid Favorites entry size.");
+        IntPtr pidl = Marshal.AllocCoTaskMem(size), root = IntPtr.Zero;
+        Marshal.Copy(entry, 5, pidl, size);
+        if (entry[0] == 0) return pidl;
+        try {
+            RequireSuccess(SHGetSpecialFolderLocation(IntPtr.Zero, entry[0], out root));
+            IntPtr absolute = ILCombine(root, pidl);
+            if (absolute == IntPtr.Zero) throw new OutOfMemoryException();
+            return absolute;
+        } finally {
+            Marshal.FreeCoTaskMem(pidl);
+            if (root != IntPtr.Zero) ILFree(root);
+        }
+    }
+    public static bool IsRetiredEntry(byte[] entry) {
+        int last = LastItemOffset(entry);
+        if (last == 0) return false;
+        byte[] item = LastItem(entry, last);
+        byte[] repaired = RepairItem(item);
+        if (repaired != null) item = repaired;
+        int first = FirstBlock(item, item.Length);
+        for (int pos = first; first != 0 && pos < item.Length; pos += BitConverter.ToUInt16(item, pos))
+            if (BitConverter.ToUInt32(item, pos + 4) == 0xBEEF002C) return true;
+        return false;
+    }
+    // The record of an entry, built from its own PIDL as Windows does.
+    public static byte[] GetEntryResolveRecord(byte[] entry) {
+        return RunOnSTA<byte[]>(delegate() {
+            IntPtr pidl = EntryPidl(entry);
+            try { return BuildRecordFromPidl(pidl); } finally { ILFree(pidl); }
+        });
+    }
+    public static byte[] SetResolveRecord(byte[] blob, int count, int index, byte[] record) {
+        if (index < 0 || index >= count) throw new ArgumentOutOfRangeException("index");
+        ValidateResolveRecord(record);
+        System.Collections.Generic.List<byte[]> records = SplitResolve(FitResolve(blob, count));
+        records[index] = record;
+        return JoinResolve(records);
+    }
+    // Fills the empty records of the active entries; a record that cannot be built stays empty.
+    public static byte[] BuildResolveCache(byte[] favorites, byte[] resolve, bool repairMissing) {
+        System.Collections.Generic.List<byte[]> entries = SplitFavorites(favorites);
+        System.Collections.Generic.List<byte[]> records = SplitResolve(FitResolve(resolve, entries.Count));
+        if (repairMissing) {
+            for (int i = 0; i < entries.Count; i++) {
+                if (records[i].Length != 4 || IsRetiredEntry(entries[i])) continue;
+                try { records[i] = GetEntryResolveRecord(entries[i]); } catch { }
+            }
+        }
+        return JoinResolve(records);
+    }
+    public static void ValidatePinState(byte[] favorites, byte[] resolve) {
+        if (SplitFavorites(favorites).Count != SplitResolve(resolve).Count)
+            throw new InvalidOperationException("Favorites and FavoritesResolve must have matching records.");
+    }
+    public static bool BytesEqual(byte[] left, byte[] right) {
+        int leftLength = left == null ? 0 : left.Length;
+        int rightLength = right == null ? 0 : right.Length;
+        if (leftLength != rightLength) return false;
+        for (int i = 0; i < leftLength; i++) if (left[i] != right[i]) return false;
+        return true;
     }
 
     private static byte[] BuildBlobEntry(IntPtr pidl, string beef001dContent)
@@ -1838,26 +2175,203 @@ public static class TaskbarPinHelper
         return GetBlobEntryInternal(lnkFullPath, beef001dContent, true);
     }
 
-    public static int FindBlobEntry(byte[] blob, string filename)
+    // The AppID Windows gives the shortcut, the one the taskbar stores in BEEF001D.
+    public static string GetShortcutAppId(string lnkPath)
     {
-        byte[] needle = System.Text.Encoding.Unicode.GetBytes(filename);
-        int pos = 0; int idx = 0;
-        while (pos < blob.Length && blob[pos] != 0xFF)
+        Guid iidItem = new Guid("43826D1E-E718-42EE-BC55-A1E261C37BFE");
+        IntPtr psi;
+        if (SHCreateItemFromParsingName(lnkPath, IntPtr.Zero, ref iidItem, out psi) != 0) return "";
+        try
         {
-            if (pos + 5 > blob.Length) break;
-            uint pidlSize = BitConverter.ToUInt32(blob, pos + 1);
-            int pidlStart = pos + 5;
-            int pidlEnd = pidlStart + (int)pidlSize;
-            if (pidlEnd > blob.Length) break;
-            for (int b = pidlStart; b + needle.Length <= pidlEnd; b++)
+            string[] resolvers = { "DE25675A-72DE-44B4-9373-05170450C140", "46A6EEFF-908E-4DC6-92A6-64BE9177B41C" };
+            foreach (string resolverIid in resolvers)
             {
-                bool match = true;
-                for (int c = 0; c < needle.Length; c++) { if (blob[b + c] != needle[c]) { match = false; break; } }
-                if (match) return idx;
+                Guid cls = new Guid("660B90C8-73A9-4B58-8CAE-355B7F55341B"), iid = new Guid(resolverIid);
+                IntPtr resolver;
+                if (CoCreateInstance(ref cls, IntPtr.Zero, 0x17, ref iid, out resolver) != 0) continue;
+                try
+                {
+                    IntPtr vtbl = Marshal.ReadIntPtr(resolver);
+                    FnGetAppIDForShortcut getAppId = (FnGetAppIDForShortcut)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(vtbl, 3 * IntPtr.Size), typeof(FnGetAppIDForShortcut));
+                    IntPtr appIdPtr;
+                    if (getAppId(resolver, psi, out appIdPtr) != 0 || appIdPtr == IntPtr.Zero) return "";
+                    try { return Marshal.PtrToStringUni(appIdPtr) ?? ""; }
+                    finally { Marshal.FreeCoTaskMem(appIdPtr); }
+                }
+                finally { Release(resolver); }
             }
-            pos = pidlEnd; idx++;
+            return "";
         }
-        return -1;
+        finally { Release(psi); }
+    }
+
+    private static void Release(IntPtr unknown)
+    {
+        FnRelease release = (FnRelease)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(Marshal.ReadIntPtr(unknown), 2 * IntPtr.Size), typeof(FnRelease));
+        release(unknown);
+    }
+
+    public static bool IsActivePath(byte[] favorites, string path) {
+        if (string.IsNullOrEmpty(path)) return false;
+        foreach (byte[] entry in SplitFavorites(favorites))
+            if (!IsRetiredEntry(entry) && string.Equals(GetEntryPath(entry), path, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+    public sealed class PinState {
+        public byte[] Favorites;
+        public byte[] Resolve;
+        public bool Changed;
+        public bool Added;
+        public int Index;
+    }
+    // Puts the item in the pin list : the entry already holding it (same AppID, else same .lnk) is
+    // kept, and repaired when needed, unless it is retired or points to another .lnk, in which
+    // case the new entry replaces it at the same position; otherwise the new entry is appended.
+    // The item gets the record unless its entry is kept with a record in Windows' form, and
+    // FavoritesResolve is aligned on Favorites (missing records are filled).
+    public static PinState PreparePinState(byte[] favorites, byte[] resolve, string path, string appId, byte[] entry, byte[] record) {
+        if (entry == null) throw new InvalidOperationException("A PIDL is required.");
+        byte[] originalFavorites = favorites;
+        if (favorites == null) favorites = new byte[] { 0xFF };
+        byte[] cache = FitResolve(resolve, CountEntries(favorites));
+        ValidateResolveRecord(record);
+        int index = FindEntryByAppId(favorites, appId);
+        if (index < 0) index = FindEntryByPath(favorites, path);
+        bool added = index < 0, setRecord = true;
+        if (added) {
+            index = CountEntries(favorites);
+            favorites = AppendEntry(favorites, entry);
+        } else {
+            byte[] pinnedEntry = GetEntry(favorites, index);
+            if (IsRetiredEntry(pinnedEntry) || !string.Equals(GetEntryPath(pinnedEntry), path, StringComparison.OrdinalIgnoreCase)) {
+                favorites = ReplaceEntry(favorites, index, entry);
+            } else {
+                byte[] repairedEntry = FixEntry(pinnedEntry, appId);
+                if (repairedEntry != null) favorites = ReplaceEntry(favorites, index, repairedEntry);
+                setRecord = !IsWindowsRecord(SplitResolve(cache)[index]);
+            }
+        }
+        if (setRecord) cache = SetResolveRecord(cache, CountEntries(favorites), index, record);
+        cache = BuildResolveCache(favorites, cache, true);
+        ValidatePinState(favorites, cache);
+        PinState state = new PinState();
+        state.Favorites = favorites;
+        state.Resolve = cache;
+        state.Index = index;
+        state.Added = added;
+        state.Changed = !BytesEqual(originalFavorites, favorites) || !BytesEqual(resolve, cache);
+        return state;
+    }
+
+    public sealed class OwnedFileWrite {
+        public bool Created;
+        public bool Changed;
+        public bool Uncertain;
+        public byte[] ExpectedBytes;
+        public Exception Error;
+    }
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern Microsoft.Win32.SafeHandles.SafeFileHandle OpenOwnedFile(string path, uint access, uint sharing,
+                                                                                  IntPtr security, uint mode, uint flags, IntPtr template);
+    private static byte[] ReadOwnedStream(FileStream stream) {
+        if (stream.Length > int.MaxValue) throw new IOException("The shortcut is too large.");
+        byte[] bytes = new byte[(int)stream.Length];
+        stream.Position = 0;
+        int read = 0;
+        while (read < bytes.Length) {
+            int count = stream.Read(bytes, read, bytes.Length - read);
+            if (count == 0) throw new IOException("The shortcut could not be read completely.");
+            read += count;
+        }
+        return bytes;
+    }
+    public static OwnedFileWrite WriteOwnedFile(string path, byte[] content, bool existed, byte[] expectedBefore) {
+        OwnedFileWrite result = new OwnedFileWrite();
+        FileStream stream = null;
+        Microsoft.Win32.SafeHandles.SafeFileHandle handle = null;
+        try {
+            handle = OpenOwnedFile(path, 0xC0000000, 1, IntPtr.Zero, existed ? 3u : 1u, 0x80000080, IntPtr.Zero);
+            if (handle.IsInvalid) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            result.Created = !existed;
+            stream = new FileStream(handle, FileAccess.ReadWrite, 1, false);
+            byte[] before = ReadOwnedStream(stream);
+            if (existed && expectedBefore != null && !BytesEqual(before, expectedBefore))
+                throw new IOException("The shortcut changed before its write.");
+            result.ExpectedBytes = before;
+            if (BytesEqual(before, WithAccessTimeOf(content, before))) return result;
+            result.Changed = true;
+            stream.Position = 0;
+            stream.Write(content, 0, content.Length);
+            stream.SetLength(content.Length);
+            stream.Flush();
+            result.ExpectedBytes = content;
+        } catch (Exception error) {
+            result.Error = error;
+            if (stream != null && (result.Created || result.Changed)) {
+                try { result.ExpectedBytes = ReadOwnedStream(stream); }
+                catch { result.Uncertain = true; result.ExpectedBytes = null; }
+            }
+            else if (result.Created) result.Uncertain = true;
+        } finally {
+            if (stream != null) {
+                try { stream.Dispose(); }
+                catch (Exception error) { if (result.Error == null) result.Error = error; result.Uncertain = true; }
+            }
+            if (handle != null) handle.Dispose();
+        }
+        return result;
+    }
+    // The shortcut with the last access times (target in the header, every item of the target
+    // path in its BEEF0004 block) taken from another shortcut of the same layout.
+    private static byte[] WithAccessTimeOf(byte[] content, byte[] other)
+    {
+        if (content.Length != other.Length || content.Length < 0x4E || BitConverter.ToUInt32(content, 0) != 0x4C) return content;
+        byte[] result = (byte[])content.Clone();
+        Array.Copy(other, 0x24, result, 0x24, 8);
+        if ((BitConverter.ToUInt32(content, 0x14) & 1) == 0) return result;
+        int end = Math.Min(content.Length, 0x4E + BitConverter.ToUInt16(content, 0x4C));
+        for (int pos = 0x4E, cb; pos + 2 <= end && (cb = BitConverter.ToUInt16(content, pos)) >= 2 && pos + cb <= end; pos += cb) {
+            byte[] item = new byte[cb];
+            Array.Copy(content, pos, item, 0, cb);
+            int first = FirstBlock(item, cb);
+            for (int block = first; first != 0 && block < cb; block += BitConverter.ToUInt16(item, block))
+                if (BitConverter.ToUInt32(item, block + 4) == 0xBEEF0004 && block + 16 <= cb) Array.Copy(other, pos + block + 12, result, pos + block + 12, 4);
+        }
+        return result;
+    }
+    public static bool WriteInPlace(string path, byte[] content)
+    {
+        byte[] current = File.ReadAllBytes(path);
+        if (current.Length == content.Length)
+        {
+            int i = 0;
+            while (i < content.Length && current[i] == content[i]) i++;
+            if (i == content.Length) return false;
+        }
+        using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.Read))
+        {
+            fs.Write(content, 0, content.Length);
+            fs.SetLength(content.Length);
+        }
+        return true;
+    }
+
+    // The taskbar compares write times in 2-second steps.
+    public static void KeepNewWriteTime(string path, DateTime previousUtc)
+    {
+        if ((File.GetLastWriteTimeUtc(path) - previousUtc).TotalSeconds < 2) File.SetLastWriteTimeUtc(path, previousUtc.AddSeconds(2));
+    }
+
+    // SHCNE_RENAMEITEM onto itself, then SHCNE_UPDATEITEM.
+    public static void NotifyShortcutChanged(string lnkPath)
+    {
+        IntPtr pathPtr = Marshal.StringToHGlobalUni(lnkPath);
+        try
+        {
+            SHChangeNotify(0x00000001, 0x1005, pathPtr, pathPtr);
+            SHChangeNotify(0x00002000, 0x1005, pathPtr, IntPtr.Zero);
+        }
+        finally { Marshal.FreeHGlobal(pathPtr); }
     }
 
     public static void SendPinNotify()
@@ -1875,6 +2389,7 @@ public static class TaskbarPinHelper
 
     public static bool AcquirePinMutex(int timeoutMs)
     {
+        if (_mutexHandle != IntPtr.Zero) return false;
         IntPtr h = CreateMutexExW(IntPtr.Zero, "TaskbarPinListMutex", 0, 0x001F0001);
         if (h == IntPtr.Zero) return false;
         uint r = WaitForSingleObject(h, (uint)timeoutMs);
@@ -1888,6 +2403,180 @@ public static class TaskbarPinHelper
     }
 }
 '@
+}
+try {[System.Windows.Forms.Application]::EnableVisualStyles()}      catch {}
+try {[DPIAware]::SetDpiAwareness([DPIAware]::PER_MONITOR_AWARE_V2)} catch {}
+
+# Scaling of the primary display (its DPI, read once the process is DPI aware)
+function Get-DisplayPrimaryScaling {
+    $graphics = [System.Drawing.Graphics]::FromHwnd([IntPtr]::Zero)
+    try { if ($graphics.DpiX -gt 0) { return [float]($graphics.DpiX / 96.0) } else { return [float]1.0 } }
+    finally { $graphics.Dispose() }
+}
+$script:DPI_Factor = Get-DisplayPrimaryScaling
+$script:StartupDpiFactor = $script:DPI_Factor
+
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+[TaskBarHelper]::SetAppId($script:AppId)
+
+#region ── ICON ─
+
+$iconBase64 = ""
+if ([string]::IsNullOrEmpty($iconBase64)) {
+    # Drawn at the largest icon size : every smaller size is a reduction of it, none an enlargement
+    $bmp = New-Object System.Drawing.Bitmap(256, 256)
+    $bmp.SetResolution(96, 96)
+    $g   = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+    $g.Clear([System.Drawing.Color]::FromArgb(0, 120, 212))
+    $f  = New-Object System.Drawing.Font("Segoe UI", 192, [System.Drawing.FontStyle]::Bold)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $g.DrawString("S", $f, [System.Drawing.Brushes]::White, (New-Object System.Drawing.RectangleF(0, 0, 256, 256)), $sf)
+    $f.Dispose(); $sf.Dispose(); $g.Dispose()
+    $iconImage = $bmp
+    $script:AppIcoBytes = [IcoBuilder]::BuildFromBitmap($bmp)
+} else {
+    $iconBytes  = [Convert]::FromBase64String($iconBase64)
+    $iconStream = New-Object IO.MemoryStream(,$iconBytes)
+    $iconImage  = [System.Drawing.Image]::FromStream($iconStream)
+    $script:AppIcoBytes = [IcoBuilder]::BuildFromBase64($iconBase64)
+}
+
+#region ── LOGGING ─
+
+$script:LogDir  = [System.IO.Path]::Combine($env:TEMP, $script:AppName)
+if (!([System.IO.Directory]::Exists($script:LogDir))) { [System.IO.Directory]::CreateDirectory($script:LogDir) | Out-Null }
+$script:LogFile = [System.IO.Path]::Combine($script:LogDir, "$($script:AppName)_$(Get-Date -Format 'yyyyMMdd').log")
+if ([System.IO.File]::Exists($script:LogFile)) {
+    [System.IO.File]::AppendAllText($script:LogFile, "`r`n`r`n`r`n------------------------------`r`n`r`n`r`n")
+}
+$logFiles = [System.IO.Directory]::GetFiles($script:LogDir, "*.log")
+if ($logFiles.Count -gt 10) {
+    $sorted = [System.Array]::CreateInstance([System.IO.FileInfo], $logFiles.Count)
+    for ($i = 0; $i -lt $logFiles.Count; $i++) { $sorted[$i] = New-Object System.IO.FileInfo($logFiles[$i]) }
+    [System.Array]::Sort($sorted, [System.Comparison[System.IO.FileInfo]]{ param($a, $b) $b.LastWriteTimeUtc.CompareTo($a.LastWriteTimeUtc) })
+    for ($i = 10; $i -lt $sorted.Count; $i++) { [System.IO.File]::Delete($sorted[$i].FullName) }
+}
+function Write-Log {
+    param([string]$Message, [ValidateSet('Info','Warning','Error','Debug')][string]$Level = 'Info')
+    if ([string]::IsNullOrEmpty($script:LogFile)) { return }
+    $ts  = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $msg = "[$ts] [$Level] $Message"
+    switch ($Level) {
+        'Error'   { Write-Host $msg -ForegroundColor Red }
+        'Warning' { Write-Host $msg -ForegroundColor Yellow }
+        'Debug'   { Write-Host $msg -ForegroundColor Gray }
+        default   { Write-Host $msg -ForegroundColor White }
+    }
+    try { [IO.File]::AppendAllText($script:LogFile, "$msg`r`n") } catch {}
+}
+Write-Log "═══ $($script:AppName) v$($script:Version) started ═══"
+Write-Log "PowerShell version : $($PSVersionTable.PSVersion)"
+Write-Log "CLR version : $([Environment]::Version)"
+Write-Log "OS : $([Environment]::OSVersion.VersionString)"
+Write-Log "Display scaling : $($script:DPI_Factor)"
+if ($isAdmin) { Write-Log "Running with administrator privileges" }
+else          { Write-Log "Running without administrator privileges"}
+
+Update-LoadingPopup 20  "Loading..."
+
+#region ── PS2.0 HELPERS ─
+
+# .NET 3.5 does not have [string]::IsNullOrWhiteSpace
+function Test-StringEmpty {
+    param([string]$Value)
+    if ($null -eq $Value) { return $true }
+    return ($Value.Trim().Length -eq 0)
+}
+
+# Check whether the icon source panel has no valid icon selected
+function Test-IconSourceEmpty {
+    if ($radioIcon_TargetDefault.Checked) {
+        return $false
+    }
+    if ($radioIcon_Base64.Checked) {
+        return (Test-StringEmpty $TextboxIcon_Base64.Text)
+    }
+    return (Test-StringEmpty (Get-CleanInput $iconPathTextbox.Text))
+}
+
+#region ── SCRIPT VARIABLES ─
+
+$script:HitTestPassThruControls = New-Object System.Collections.Generic.List[System.Windows.Forms.Control]
+$script:HitTestNativeWindows    = New-Object System.Collections.ArrayList
+$script:CleanupDone             = $false
+
+$script:UserPinnedStartMenu     = $false
+$script:GroupPadding            = 10
+
+$script:FormBorderPenLight = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(200,200,200), 1)
+$script:FormBorderPenDark  = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(60,60,60), 1)
+$script:DropZonePen        = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 200, 0), 2)
+$script:GroupBoxBorderPen  = New-Object System.Drawing.Pen([System.Drawing.SystemColors]::ControlDark)
+
+$script:CurrentIconIndex    = 0
+$script:CurrentExeIconCount = 0
+$script:SuppressPreviewUpdate   = $false
+
+$script:AdsProbeCache = @{}
+$script:CplItemCache  = @{}
+$script:CpItemsCache  = $null   # Control Panel picker : its items and their icons, read once
+$script:CpIconCache   = @{}
+
+# Characters an AUMID may hold here : those of "Company.App.1", plus "_" and "!" of a Store
+# app's ("Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")
+# The regexes are not compiled : on such short inputs that only adds about 20 ms at startup
+$script:AumidCleanRegex = New-Object System.Text.RegularExpressions.Regex('[^a-zA-Z0-9.\-_!]')
+$script:AumidLeadDotRegex = New-Object System.Text.RegularExpressions.Regex('^\.+')
+
+$script:BuiltIconMenuPath = $null
+$script:ShellTargetIconCache = $null
+$script:PinButtonBusy = $false
+$script:TaskbarPinBusy = $false
+$script:LastPinnedTaskbarFile = ""
+$script:LastPinnedConfigKey   = ""     # target|lnk snapshot from the last taskbar pin
+$script:LnkHintShown          = $null  # warning under Shortcut location set by Update-CreateButtonState
+$script:AutoAumid             = $null  # AUMID filled in by a dropped app, cleared with it when the target changes
+$script:AutoAumidTarget       = $null
+
+# Shortcut limits (MS-SHLLINK spec)
+$script:MaxTargetPath        = 259      # MAX_PATH less its terminating null : a longer target fails to save
+$script:MaxArgsCreateProcess = 32767
+$script:MaxArgsCmdExe        = 8191
+
+# Supported file extensions
+$script:ImageExtensions      = @('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.ico', '.tiff')
+$script:ExeExtensions        = @('.exe', '.dll', '.ocx', '.cpl', '.scr')
+$script:StandardIconExt      = @('.ico', '.exe', '.dll', '.ocx', '.cpl', '.scr')
+$script:CurrentPreviewBitmap = $null
+$script:ActiveDropZone       = $null
+$script:SuppressAutoFill     = $false
+$script:PreviousTargetText   = ""
+$script:DeclinedSplitText    = $null
+$script:SuppressTargetSplit  = $false
+$script:ArgsFromAutoSplit    = $false
+$script:ShellTargetRegexOpts = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+$script:ShellTargetRegex     = New-Object System.Text.RegularExpressions.Regex('^(::\{|\{[0-9a-fA-F]{8}-|shell:::\{|shell:[a-zA-Z])', $script:ShellTargetRegexOpts)
+$script:IsUrlTarget          = $false
+$script:IsShellTarget        = $false
+$script:UrlTargetRegex       = New-Object System.Text.RegularExpressions.Regex('^[a-zA-Z][a-zA-Z0-9+.\-]*://', $script:ShellTargetRegexOpts)
+$script:ExtSplitRegex        = New-Object System.Text.RegularExpressions.Regex('(?i)\.(exe|bat|cmd|ps1|vbs|com|msi|wsf|scr|cpl)\b')
+$script:ProbeExts = if (-not [string]::IsNullOrEmpty($env:PATHEXT)) {
+    $env:PATHEXT.Split(';') | Where-Object { $_.Length -gt 0 }
+} else {
+    [string[]]@('.exe', '.bat', '.cmd', '.com')
+}
+$script:PathDirs = $null      # PATH folders, listed on first use (a network one can take seconds)
+
+# Theme color
+$script:IsDarkMode       = $false
+$script:SystemDarkMode   = $false      # the system's theme as last read : only its change overrides the user's toggle
+$script:AboutNormalColor = [System.Drawing.Color]::FromArgb(228, 228, 228)
+$script:AboutHoverColor  = [System.Drawing.Color]::FromArgb(210, 210, 210)
+
+[DarkMode]::Init()
 
 #region ── HELPER FUNCTIONS ─
 
@@ -2143,8 +2832,10 @@ function Invoke-ShellItemDrop {
                     try { $script:ShellTargetIconCache.Dispose() } catch {}
                 }
                 $script:ShellTargetIconCache = [ShellDropHelper]::ExtractIconFromCida($cidaBytes)
-                # Bare AUMID detection : UWP apps resolve as "PackageFamily!AppId" without shell: prefix
-                if ($shellPath.Contains('!') -and -not $script:ShellTargetRegex.IsMatch($shellPath.TrimStart())) {
+                # Bare AUMID detection : an app of the Applications folder resolves to its AUMID alone,
+                # "PackageFamily!AppId" for a Store app, "Chrome" or "{GUID}\App.exe" for a desktop one
+                if (-not $script:ShellTargetRegex.IsMatch($shellPath.TrimStart()) -and $shellPath -notmatch '^([a-zA-Z]:|\\\\)' -and
+                    $null -ne [ShortcutHelper]::GetShellDisplayName("shell:AppsFolder\$shellPath")) {
                     $shellPath = "shell:AppsFolder\$shellPath"
                     Write-Log "Shell item drop : bare AUMID detected, prefixed to '$shellPath'" -Level Debug
                 }
@@ -2152,8 +2843,13 @@ function Invoke-ShellItemDrop {
                 $textTarget.Text = $shellPath
                 $script:SuppressTargetSplit = $false
                 $appsPrefix = "shell:AppsFolder\"
-                if ($shellPath.StartsWith($appsPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $textAumid.Text = $shellPath.Substring($appsPrefix.Length)
+                # The app's AUMID, when the box can hold it as it is : a generated one such as
+                # "{GUID}\App.exe" is left out, Windows gives the shortcut that one by itself
+                $appAumid = if ($shellPath.StartsWith($appsPrefix, [System.StringComparison]::OrdinalIgnoreCase)) { $shellPath.Substring($appsPrefix.Length) } else { '' }
+                if ($appAumid.Length -gt 0 -and $appAumid.Length -le 128 -and -not $script:AumidCleanRegex.IsMatch($appAumid)) {
+                    $textAumid.Text = $appAumid
+                    $script:AutoAumid = $appAumid
+                    $script:AutoAumidTarget = $shellPath
                 }
                 if (-not (Test-StringEmpty $displayName)) {
                     $textDescription.Text = $displayName
@@ -2163,7 +2859,7 @@ function Invoke-ShellItemDrop {
                 }
             }
             'lnk' {
-                $name = if (-not (Test-StringEmpty $displayName)) { $displayName } else { "Shortcut" }
+                $name = Get-SafeFileName $displayName
                 $currentLnk = Get-CleanInput $textLnkPath.Text
                 if (Test-StringEmpty $currentLnk) {
                     $hasExistingFields = -not (Test-StringEmpty (Get-CleanInput $textTarget.Text))
@@ -2222,6 +2918,15 @@ $script:Base64DebounceTimer.Add_Tick({
     Update-IconPreview
     Update-NtfsWarning
 })
+
+# Debounce timer for the target icon preview while the user types a target
+$script:TargetPreviewDebounceTimer = New-Object System.Windows.Forms.Timer
+$script:TargetPreviewDebounceTimer.Interval = 300
+$script:TargetPreviewDebounceTimer.Add_Tick({
+    $this.Stop()
+    if ($script:SuppressPreviewUpdate -or -not $radioIcon_TargetDefault.Checked) { return }
+    Update-IconPreview
+})
 $script:CreateBtnFlashTimer = $null
 function Reset-CreateButtonFlash {
     if ($null -ne $script:CreateBtnFlashTimer) {
@@ -2258,7 +2963,70 @@ function Get-CleanInput {
     return $Text.Trim().Trim('"').Trim("'").Trim()
 }
 
-# Check if path is on NTFS volume
+# ── The AUMID and the description to write : none from a field the target leaves disabled
+#    (a document has no AUMID, a .url neither, nor a description) ──
+function Get-ActiveAumid {
+    if (-not $textAumid.Enabled) { return '' }
+    return Get-CleanInput $textAumid.Text
+}
+function Get-ActiveDescription {
+    if (-not $textDescription.Enabled) { return '' }
+    return $textDescription.Text.Trim()
+}
+
+# ── A name usable as a file name, never empty : the characters a file name cannot hold are
+#    removed, as Explorer does ("Local Disk (C:)" gives "Local Disk (C)") ──
+function Get-SafeFileName {
+    param([string]$Name)
+    $clean = [regex]::Replace([regex]::Replace([string]$Name, '[\x00-\x1F<>:"/\\|?*]', ''), '\s{2,}', ' ').Trim()
+    # At most 100 characters : a pinned shortcut's path plus its icon stream name must fit in 259
+    if ($clean.Length -gt 100) { $clean = $clean.Substring(0, 100) }
+    $clean = $clean.TrimEnd('.', ' ')
+    if (Test-StringEmpty $clean) { return 'Shortcut' }
+    return $clean
+}
+
+# ── Name (without extension) of a shortcut to the target, as Explorer would name it ──
+# A URL : its host. A shell item : the name the shell shows ("Calculator" for an
+# AppsFolder app). A folder : its whole name, a drive the shell's name ("Local Disk (C)").
+# A file : its name without extension.
+function Get-TargetShortcutName {
+    param([string]$TargetPath, [string]$Description)
+    $name = ''
+    try {
+        if ($script:UrlTargetRegex.IsMatch($TargetPath)) {
+            $name = ([Uri]$TargetPath).Host -replace '^www\.', ''
+        }
+        elseif ($script:ShellTargetRegex.IsMatch($TargetPath)) {
+            $name = [ShortcutHelper]::GetShellDisplayName($TargetPath)
+            if (Test-StringEmpty $name) { $name = $Description }
+        }
+        elseif ([IO.Directory]::Exists($TargetPath)) {
+            $name = [IO.Path]::GetFileName($TargetPath.TrimEnd('\', '/'))
+            if (Test-StringEmpty $name) { $name = [ShortcutHelper]::GetShellDisplayName($TargetPath) }
+        }
+        elseif ($TargetPath.EndsWith('.cpl', [StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists((Get-CplFullPath $TargetPath))) {
+            # A .cpl is pinned under its Control Panel name ("Mouse" for main.cpl)
+            $cplItem = Resolve-CplControlPanelItem $TargetPath
+            $name = if ($null -ne $cplItem) { $cplItem.Name } else { [IO.Path]::GetFileNameWithoutExtension($TargetPath) }
+        }
+        else {
+            $name = [IO.Path]::GetFileNameWithoutExtension($TargetPath)
+        }
+    } catch {}
+    return Get-SafeFileName $name
+}
+
+# ── Name (without extension) of the pinned shortcut : the shortcut location's, else the target's ──
+function Get-PinShortcutName {
+    param([string]$LnkPath, [string]$TargetPath, [string]$Description)
+    if (-not (Test-StringEmpty $LnkPath)) {
+        try { return Get-SafeFileName ([IO.Path]::GetFileNameWithoutExtension($LnkPath)) } catch {}
+    }
+    return Get-TargetShortcutName $TargetPath $Description
+}
+
+# Check if path is on a volume that holds alternate data streams : NTFS, or ReFS (Dev Drive)
 function Test-NtfsVolume {
     param([string]$Path)
     try {
@@ -2268,14 +3036,14 @@ function Test-NtfsVolume {
         if ($root.StartsWith('\\')) { return $true }
         $drive = New-Object System.IO.DriveInfo($root)
         if (-not $drive.IsReady) { return $true }
-        if ($drive.DriveFormat -ne 'NTFS') { return $false }
+        if ($drive.DriveFormat -ne 'NTFS' -and $drive.DriveFormat -ne 'ReFS') { return $false }
         # Find the deepest existing directory in the path
         $testDir = [System.IO.Path]::GetDirectoryName($Path)
         while (-not (Test-StringEmpty $testDir) -and -not [System.IO.Directory]::Exists($testDir)) {
             $testDir = [System.IO.Path]::GetDirectoryName($testDir)
         }
         if (Test-StringEmpty $testDir) { return $true }
-        # Root-level directory : pure NTFS, no probe needed
+        # Root-level directory : not probed, a drive's root is often not writable
         if ($testDir.TrimEnd('\') -eq $root.TrimEnd('\')) { return $true }
         # Check cache (avoids re-probing while user types)
         $cacheKey = $testDir.ToLower().TrimEnd('\')
@@ -2317,7 +3085,7 @@ function Update-NtfsWarning {
     $hasIcon = if ($radioIcon_Base64.Checked) { -not (Test-StringEmpty $TextboxIcon_Base64.Text) }
                else { -not (Test-StringEmpty (Get-CleanInput $iconPathTextbox.Text)) }
     if ($embedMode -and $hasIcon -and -not (Test-NtfsVolume $lnkPath)) {
-        $labelLnkInfo.Text = "Destination not on NTFS - ADS icon embedding will fail."
+        $labelLnkInfo.Text = "Destination has no NTFS streams - ADS icon embedding will fail."
         $labelLnkInfo.ForeColor = [System.Drawing.Color]::Red
     }
     else {
@@ -2396,24 +3164,18 @@ function Get-PreviewFromFile {
         $ext = [System.IO.Path]::GetExtension($FilePath).ToLower()
         if ($script:ExeExtensions -contains $ext) {
             $idx = $script:CurrentIconIndex
-            # For negative resource IDs or when PE table is unreadable, probe standard sizes directly
+            # Largest size in the PE table (a negative index is a resource ID). When the table
+            # gives none but the icon extracts, 48 px : the size the embedded icon gets then
+            # (GetMaxNativeSize), as PrivateExtractIcons scales to any size asked.
             $nativeSizes = [IcoBuilder]::GetNativeSizes($FilePath, $idx)
             if ($nativeSizes.Length -gt 0) {
                 $maxNative = $nativeSizes[$nativeSizes.Length - 1]
             }
+            elseif ([IcoBuilder]::CanExtractIcon($FilePath, $idx)) {
+                $maxNative = 48
+            }
             else {
-                # Probe descending : PrivateExtractIcons handles resource IDs natively
                 $maxNative = 0
-                foreach ($probe in @(256, 128, 64, 48, 32, 16)) {
-                    if ([IcoBuilder]::CanExtractIcon($FilePath, $idx)) {
-                        $testBmp = [IcoBuilder]::ExtractBitmapAtSize($FilePath, $idx, $probe)
-                        if ($null -ne $testBmp) {
-                            $maxNative = $probe
-                            $testBmp.Dispose()
-                            break
-                        }
-                    }
-                }
             }
             Write-Log "IcoBuilder diagnostic : $([IcoBuilder]::LastDiagnostic)" -Level Debug
             if ($maxNative -le 0) {
@@ -2456,12 +3218,17 @@ function Get-PreviewFromFile {
 }
 
 # ── Build ICO bytes from the currently selected icon source ──
+# An ICO (a .ico file, or Base64 of one, as an imported shortcut's icon) is kept as it is,
+# with every size it was drawn at; other images are rebuilt at the standard sizes. The bytes
+# are returned as one array (",") : PowerShell would otherwise send them one by one.
 function Get-IcoBytesFromCurrentSource {
     try {
         if ($radioIcon_Base64.Checked) {
             $clean = Get-CleanInput $TextboxIcon_Base64.Text
             if (Test-StringEmpty $clean) { return $null }
-            return [IcoBuilder]::BuildFromBase64($clean)
+            $bytes = [System.Convert]::FromBase64String($clean)
+            if ([IcoBuilder]::IsValidIco($bytes)) { return ,$bytes }
+            return ,([IcoBuilder]::BuildFromBase64($clean))
         }
         else {
             $filePath = Get-CleanInput $iconPathTextbox.Text
@@ -2470,12 +3237,14 @@ function Get-IcoBytesFromCurrentSource {
             if ($script:ExeExtensions -contains $ext) {
                 $result = [IcoBuilder]::BuildFromExecutableEx($filePath, $script:CurrentIconIndex)
                 Write-Log "IcoBuilder diagnostic : $([IcoBuilder]::LastDiagnostic)" -Level Debug
-                return $result
+                if ($null -eq $result) { return $null }
+                return ,$result
             }
             elseif ($script:ImageExtensions -contains $ext) {
                 $ms = $null; $bmp = $null; $ico = $null
                 try {
                     $bytes = [System.IO.File]::ReadAllBytes($filePath)
+                    if ($ext -eq '.ico' -and [IcoBuilder]::IsValidIco($bytes)) { return ,$bytes }
                     $ms = New-Object System.IO.MemoryStream(,$bytes)
                     if ($ext -eq '.ico') {
                         $ico = New-Object System.Drawing.Icon($ms, 256, 256)
@@ -2485,7 +3254,7 @@ function Get-IcoBytesFromCurrentSource {
                         $bmp = New-Object System.Drawing.Bitmap($ms)
                     }
                     $result = [IcoBuilder]::BuildFromBitmap($bmp)
-                    return $result
+                    return ,$result
                 }
                 finally {
                     if ($null -ne $ico) { try { $ico.Dispose() } catch {} }
@@ -2507,9 +3276,9 @@ function New-ShortcutFromFields {
     param([string]$OutputPath)
     # Returns @{ IconMode; IcoBytes; IconFilePath; IconIndex } or $null on icon build failure
     $targetPath   = Get-CleanInput $textTarget.Text
-    $userDesc     = $textDescription.Text.Trim()
+    $userDesc     = Get-ActiveDescription
     if (Test-StringEmpty $userDesc) { $userDesc = [IO.Path]::GetFileNameWithoutExtension($OutputPath) }
-    $userAumid    = Get-CleanInput $textAumid.Text
+    $userAumid    = Get-ActiveAumid
     $useEmbed     = $radioIcon_Base64.Checked -or ($radioIcon_AnyFile.Checked -and $radioEmbedIcon.Checked)
     $hasIcon      = if ($radioIcon_TargetDefault.Checked) { $false }
                     elseif ($radioIcon_Base64.Checked) { -not (Test-StringEmpty $TextboxIcon_Base64.Text) }
@@ -2584,137 +3353,408 @@ function New-ShortcutFromFields {
     return @{ IconMode = $iconMode; IcoBytes = $icoBytes; IconFilePath = $iconFilePath; IconIndex = $iconIndex }
 }
 
-# ── Pin a single .lnk to the taskbar via blob injection ──
+# ── Point a shortcut whose icon lives in an alternate data stream to that icon in a stream of HostPath ──
+function Set-OwnAdsIcon {
+    param([string]$ShortcutPath, [string]$HostPath)
+    # Returns the icon bytes (the caller writes the stream), or $null when the icon is not in a stream
+    $adsIcon = Split-AdsIconLocation ([ShortcutHelper]::GetIconPath($ShortcutPath))
+    if ($null -eq $adsIcon) { return $null }
+    $icoBytes = $null
+    foreach ($adsSource in @($adsIcon.HostPath, $ShortcutPath)) {
+        if ([IO.File]::Exists($adsSource)) {
+            $icoBytes = [AdsHelper]::ReadStream($adsSource, $adsIcon.StreamName)
+            if ($null -ne $icoBytes -and $icoBytes.Length -gt 0) { break }
+        }
+    }
+    if ($null -eq $icoBytes -or $icoBytes.Length -eq 0) { return $null }
+    $ownLocation = $HostPath + ':' + [ShortcutHelper]::IconStreamName($icoBytes)
+    if (-not [string]::Equals($adsIcon.HostPath + ':' + $adsIcon.StreamName, $ownLocation, [System.StringComparison]::OrdinalIgnoreCase)) {
+        [ShortcutHelper]::UpdateIconOnly($ShortcutPath, $ownLocation)
+    }
+    return ,$icoBytes
+}
+
+# Commits the pin list and its resolution cache : FavoritesResolve and Favorites, then
+# FavoritesVersion, then FavoritesChanges last (a DWORD that wraps around), the counter the
+# taskbar compares before re-reading its pins. Nothing is written when the list changed since
+# it was read (not all of explorer.exe's pin list saves take the mutex). When a write fails,
+# the values already written are put back; TaskbarPinStateUncertain tells when that failed too.
+function Save-ShortcuteriePinState {
+    param($RegistryKeyHandle, [byte[]]$FavoritesBlob, [byte[]]$FavoritesResolveBlob,
+          [byte[]]$ExpectedFavorites, [byte[]]$ExpectedResolve)
+    $script:TaskbarPinStateUncertain = $false
+    [TaskbarPinHelper]::ValidatePinState($FavoritesBlob, $FavoritesResolveBlob)
+    $option = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+    $currentFavorites = $RegistryKeyHandle.GetValue('Favorites', $null, $option)
+    if ($null -eq $currentFavorites) { $currentFavorites = [byte[]]@(255) }
+    if (-not [TaskbarPinHelper]::BytesEqual($currentFavorites, $ExpectedFavorites) -or
+        -not [TaskbarPinHelper]::BytesEqual($RegistryKeyHandle.GetValue('FavoritesResolve', $null, $option), $ExpectedResolve)) {
+        throw 'The pin list changed after preparation; no registry value was written.'
+    }
+    $changes = [int]$RegistryKeyHandle.GetValue('FavoritesChanges', 0, $option)
+    $binary = [Microsoft.Win32.RegistryValueKind]::Binary
+    $dword = [Microsoft.Win32.RegistryValueKind]::DWord
+    $valuesToWrite = @(
+        @{ Name = 'FavoritesResolve'; Data = $FavoritesResolveBlob; Kind = $binary },
+        @{ Name = 'Favorites';        Data = $FavoritesBlob;        Kind = $binary },
+        @{ Name = 'FavoritesVersion'; Data = 3;                     Kind = $dword },
+        @{ Name = 'FavoritesChanges'; Data = [BitConverter]::ToInt32([BitConverter]::GetBytes([long]$changes + 1), 0); Kind = $dword })
+    $previousValues = @()
+    try {
+        foreach ($valueToWrite in $valuesToWrite) {
+            $previousData = $RegistryKeyHandle.GetValue($valueToWrite.Name, $null, $option)
+            $previousValues += @{ Name = $valueToWrite.Name; Data = $previousData; Kind = $(if ($null -ne $previousData) { $RegistryKeyHandle.GetValueKind($valueToWrite.Name) }) }
+            $RegistryKeyHandle.SetValue($valueToWrite.Name, $valueToWrite.Data, $valueToWrite.Kind)
+        }
+    } catch {
+        foreach ($previousValue in $previousValues) {
+            try {
+                if ($null -eq $previousValue.Data) { $RegistryKeyHandle.DeleteValue($previousValue.Name, $false) }
+                else { $RegistryKeyHandle.SetValue($previousValue.Name, $previousValue.Data, $previousValue.Kind) }
+            } catch { $script:TaskbarPinStateUncertain = $true }
+        }
+        throw
+    }
+}
+
+function Assert-TaskbarPinHelper {
+    $helperType = 'TaskbarPinHelper' -as [Type]
+    $recordFormat = if ($null -ne $helperType) { $helperType.GetField('RecordFormat') }
+    if ($null -eq $recordFormat -or $recordFormat.GetValue($null) -ne 2) {
+        throw 'The loaded taskbar helper is incompatible. Open a new PowerShell session before pinning.'
+    }
+}
+
+function Get-ShortcuteriePinValues {
+    param($Key)
+    $option = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
+    $names = @($Key.GetValueNames())
+    foreach ($name in @('Favorites', 'FavoritesResolve')) {
+        if ($names -contains $name -and $Key.GetValueKind($name) -ne [Microsoft.Win32.RegistryValueKind]::Binary) {
+            throw "Invalid registry value kind : $name"
+        }
+    }
+    $favorites = $Key.GetValue('Favorites', $null, $option)
+    $resolve = $Key.GetValue('FavoritesResolve', $null, $option)
+    if ($null -eq $favorites) {
+        $favorites = [byte[]]@(0xFF)
+    }
+    [TaskbarPinHelper]::CountEntries($favorites) | Out-Null
+    return @{ Favorites = $favorites; Resolve = $resolve }
+}
+
+function Set-ShortcuteriePinState {
+    param($Key, [string]$Path, [string]$AppId, [byte[]]$Entry, [byte[]]$Record)
+    $script:TaskbarPinStateUncertain = $false
+    $values = Get-ShortcuteriePinValues $Key
+    $state = [TaskbarPinHelper]::PreparePinState($values.Favorites, $values.Resolve, $Path, $AppId, $Entry, $Record)
+    if ($state.Changed) {
+        Save-ShortcuteriePinState $Key $state.Favorites $state.Resolve $values.Favorites $values.Resolve
+    }
+    return $state
+}
+
+function Test-CurrentTaskbarPin {
+    param([string]$Path, [switch]$PreserveOnReadFailure)
+    $key = $null
+    # No pinned file, no pin : the pin list is read only when the file is there
+    if (-not [IO.File]::Exists($Path)) { return $false }
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband', $false)
+        if ($null -eq $key) {
+            throw 'The current pin list could not be read.'
+        }
+        $values = Get-ShortcuteriePinValues $key
+        return [TaskbarPinHelper]::IsActivePath($values.Favorites, $Path)
+    } catch {
+        return [bool]$PreserveOnReadFailure
+    } finally {
+        if ($null -ne $key) {
+            $key.Close()
+        }
+    }
+}
+
+# True when the taskbar holds a pin of Shortcuterie itself, found by its AppID whatever the
+# pinned file's name; also when the pin list cannot be read (nothing is removed then).
+function Test-OwnTaskbarPin {
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband', $false)
+        if ($null -eq $key) {
+            throw 'The current pin list could not be read.'
+        }
+        $favorites = (Get-ShortcuteriePinValues $key).Favorites
+        $index = [TaskbarPinHelper]::FindEntryByAppId($favorites, $script:AppId)
+        return $index -ge 0 -and -not [TaskbarPinHelper]::IsRetiredEntry([TaskbarPinHelper]::GetEntry($favorites, $index))
+    } catch {
+        return $true
+    } finally {
+        if ($null -ne $key) {
+            $key.Close()
+        }
+    }
+}
+
+function New-PinStagingDirectory {
+    $path = [IO.Path]::Combine([IO.Path]::GetTempPath(), 'shortcuterie-pin-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($path) | Out-Null
+    return $path
+}
+
+function Remove-PinStagingDirectory {
+    param([string]$Path)
+    if ([string]::IsNullOrEmpty($Path)) {
+        return
+    }
+    $resolvedPath = [IO.Path]::GetFullPath($Path)
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if (-not $resolvedPath.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetFileName($resolvedPath) -notmatch '^shortcuterie-pin-[0-9a-f]{32}$') {
+        throw 'The pin staging directory is outside its permitted scope.'
+    }
+    if ([IO.Directory]::Exists($resolvedPath)) {
+        Remove-Item -LiteralPath $resolvedPath -Recurse -Force
+    }
+}
+
+function Restore-ShortcuteriePinFile {
+    param([string]$Path, [bool]$ExistedBefore, [byte[]]$OriginalBytes, [DateTime]$OriginalWriteTime, [byte[]]$ExpectedBytes)
+    if ($null -ne $ExpectedBytes -and [IO.File]::Exists($Path) -and
+        -not [TaskbarPinHelper]::BytesEqual([IO.File]::ReadAllBytes($Path), $ExpectedBytes)) {
+        throw 'The shortcut changed outside this transaction; it was kept.'
+    }
+    if ($ExistedBefore) {
+        [TaskbarPinHelper]::WriteInPlace($Path, $OriginalBytes) | Out-Null
+        [IO.File]::SetLastWriteTimeUtc($Path, $OriginalWriteTime)
+    } elseif ([IO.File]::Exists($Path)) {
+        [IO.File]::Delete($Path)
+    }
+}
+
+# Pin or update a shortcut with a complete resolution cache.
 function Invoke-TaskbarPin {
     param([string]$LnkPath)
+    if ($script:TaskbarPinBusy) {
+        return $false
+    }
+    Assert-TaskbarPinHelper
     $taskBarDir = [IO.Path]::Combine($env:APPDATA, 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar')
-    $regSubKey  = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
+    $regSubKey = 'Software\Microsoft\Windows\CurrentVersion\Explorer\Taskband'
     if (-not [IO.Directory]::Exists($taskBarDir)) {
         Write-Log "Taskbar pin directory not found : $taskBarDir" -Level Error
         return $false
     }
-    $regProbe = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regSubKey, $false)
-    if (-not $regProbe) {
-        Write-Log "Taskband registry key not found" -Level Error
+    $mutexAcquired = [TaskbarPinHelper]::AcquirePinMutex(5000)
+    if (-not $mutexAcquired) {
+        Write-Log 'Pin mutex timeout' -Level Error
         return $false
     }
-    $regProbe.Close()
-    # Resolve beef001d content (display name for the blob entry)
-    $beef001d = $null
-    foreach ($beef001dResolver in @(
-        { [ShortcutHelper]::GetAppUserModelId($LnkPath) },
-        { [ShortcutHelper]::GetTargetPath($LnkPath) },
-        { [ShortcutHelper]::GetParsedDisplayName($LnkPath) },
-        { [IO.Path]::GetFileNameWithoutExtension($LnkPath) }
-    )) {
-        try { $beef001d = & $beef001dResolver } catch {}
-        if (-not (Test-StringEmpty $beef001d)) { break }
-    }
-    if ((-not (Test-StringEmpty $beef001d)) -and $beef001d.EndsWith('.cpl', [System.StringComparison]::OrdinalIgnoreCase)) {
-        $resolvedCplBeef = $beef001d
-        if (-not [IO.File]::Exists($resolvedCplBeef)) {
-            $system32Candidate = [IO.Path]::Combine($env:SystemRoot, 'System32', [IO.Path]::GetFileName($beef001d))
-            if ([IO.File]::Exists($system32Candidate)) { $resolvedCplBeef = $system32Candidate }
-        }
-        $cplItem = Resolve-CplControlPanelItem $resolvedCplBeef
-        if ($null -ne $cplItem) {
-            $beef001d = $cplItem.Path
-            Write-Log "Taskbar pin : .cpl beef001d resolved to '$beef001d'" -Level Debug
-        }
-    }
-    Write-Log "Taskbar pin : beef001d = '$beef001d'" -Level Debug
-    # Copy .lnk to taskbar pinned directory. Mirror Pin-Taskbar.ps1 : an already-pinned
-    # destination .lnk is REUSED as-is, never overwritten. Overwriting (or re-saving) a
-    # live pin desyncs the file from its registry blob entry and triggers an
-    # SHCNE_UPDATEITEM burst that corrupts the taskbar icon cache.
-    $destLnk = [IO.Path]::Combine($taskBarDir, [IO.Path]::GetFileName($LnkPath))
-    $destAlreadyPinned = [IO.File]::Exists($destLnk)
-    if (-not $destAlreadyPinned) {
-        try { [IO.File]::Copy($LnkPath, $destLnk, $true) }
-        catch {
-            Write-Log "Failed to copy .lnk to taskbar directory : $($_.Exception.Message)" -Level Error
-            return $false
-        }
-    }
-    else {
-        Write-Log "Taskbar pin : destination already present, reusing existing .lnk : $destLnk" -Level Debug
-    }
-    $script:LastPinnedTaskbarFile = [IO.Path]::GetFileName($destLnk)
-    $script:LastPinnedConfigKey   = (Get-CleanInput $textTarget.Text) + '|' + (Get-CleanInput $textLnkPath.Text)
-    # Repoint ADS IconLocation to the copied file path, then re-embed ADS (Save wipes it).
-    # Only on a freshly copied file : re-saving an already-pinned .lnk is exactly the
-    # mutation that corrupts the live pin, so it is skipped when the file is reused.
-    if (-not $destAlreadyPinned) {
+    $script:TaskbarPinBusy = $true
+    $key = $null
+    $stageDirectory = $null
+    $destLnk = $null
+    $originalBytes = $null
+    $previousWriteTime = [DateTime]::MinValue
+    $previousIcon = $null
+    $streamName = $null
+    $destFileExists = $false
+    $fileWritten = $false
+    $committed = $false
+    $fileOwnershipUncertain = $false
+    $rollbackExpectedBytes = $null
+    $script:TaskbarPinStateUncertain = $false
+    $state = $null
+    $shortcutChanged = $false
+    $destinationActive = $false
+    $pinConfigKey = $null
+    try {
         try {
-            $currentIconPath = [ShortcutHelper]::GetIconPath($destLnk)
-            if ((-not [string]::IsNullOrEmpty($currentIconPath)) -and $currentIconPath.EndsWith(':icon.ico', [System.StringComparison]::OrdinalIgnoreCase)) {
-                $adsBytes = [AdsHelper]::ReadStream($destLnk, "icon.ico")
-                [ShortcutHelper]::UpdateIconOnly($destLnk)
-                if ($null -ne $adsBytes -and $adsBytes.Length -gt 0) {
-                    [AdsHelper]::WriteStream($destLnk, "icon.ico", $adsBytes)
-                    Write-Log "Taskbar pin : IconLocation repointed + ADS re-embedded ($($adsBytes.Length) bytes)" -Level Debug
+            $pinConfigKey = (Get-CleanInput $textTarget.Text) + '|' + (Get-CleanInput $textLnkPath.Text)
+            $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regSubKey, $true)
+            if ($null -eq $key) {
+                throw 'Cannot open Taskband registry key for writing.'
+            }
+            $values = Get-ShortcuteriePinValues $key
+            $favBlob = $values.Favorites
+            $appId = [TaskbarPinHelper]::GetShortcutAppId($LnkPath)
+            $appIdFromWindows = -not (Test-StringEmpty $appId)
+            if (-not $appIdFromWindows) {
+                foreach ($resolver in @(
+                    { [ShortcutHelper]::GetAppUserModelId($LnkPath) },
+                    { [ShortcutHelper]::GetTargetPath($LnkPath) },
+                    { [ShortcutHelper]::GetParsedDisplayName($LnkPath) },
+                    { [IO.Path]::GetFileNameWithoutExtension($LnkPath) }
+                )) {
+                    try {
+                        $appId = & $resolver
+                    } catch {}
+                    if (-not (Test-StringEmpty $appId)) {
+                        break
+                    }
+                }
+                if (-not (Test-StringEmpty $appId) -and $appId.EndsWith('.cpl', [StringComparison]::OrdinalIgnoreCase)) {
+                    $cplItem = Resolve-CplControlPanelItem $appId
+                    if ($null -ne $cplItem) {
+                        $appId = $cplItem.Path
+                    }
                 }
             }
+            if (Test-StringEmpty $appId) {
+                throw 'The shortcut has no usable application identity.'
+            }
+            $pinIndex = [TaskbarPinHelper]::FindEntryByAppId($favBlob, $appId)
+            if ($pinIndex -ge 0) {
+                $pinnedEntry = [TaskbarPinHelper]::GetEntry($favBlob, $pinIndex)
+                if (-not [TaskbarPinHelper]::IsRetiredEntry($pinnedEntry)) {
+                    $path = [TaskbarPinHelper]::GetEntryPath($pinnedEntry)
+                    if (-not (Test-StringEmpty $path) -and $path.EndsWith('.lnk', [StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists($path)) {
+                        $destLnk = $path
+                    }
+                }
+            }
+            if ($null -eq $destLnk) {
+                # A name used by another application's pin, or by a .lnk whose AppID cannot be read,
+                # gets ' (2)', ' (3)'..., as Windows does : it never writes over another file.
+                $destLnk = [IO.Path]::Combine($taskBarDir, [IO.Path]::GetFileName($LnkPath))
+                for ($nameSuffix = 2; [IO.File]::Exists($destLnk); $nameSuffix++) {
+                    $existingAppId = [TaskbarPinHelper]::GetShortcutAppId($destLnk)
+                    if (-not (Test-StringEmpty $existingAppId) -and [string]::Equals($existingAppId, $appId, [StringComparison]::OrdinalIgnoreCase)) {
+                        break
+                    }
+                    $destLnk = [IO.Path]::Combine($taskBarDir, [IO.Path]::GetFileNameWithoutExtension($LnkPath) + " ($nameSuffix).lnk")
+                }
+            }
+            if (-not [string]::Equals([IO.Path]::GetFullPath([IO.Path]::GetDirectoryName($destLnk)), [IO.Path]::GetFullPath($taskBarDir), [StringComparison]::OrdinalIgnoreCase)) {
+                throw 'A pinned shortcut must stay directly in the TaskBar directory.'
+            }
+            $destinationActive = [TaskbarPinHelper]::IsActivePath($favBlob, $destLnk)
+            $destFileExists = [IO.File]::Exists($destLnk)
+            if ($destFileExists) {
+                $originalBytes = [IO.File]::ReadAllBytes($destLnk)
+                $previousWriteTime = [IO.File]::GetLastWriteTimeUtc($destLnk)
+                try {
+                    $previousIcon = Split-AdsIconLocation ([ShortcutHelper]::GetIconPath($destLnk))
+                } catch {}
+            }
+            $stageDirectory = New-PinStagingDirectory
+            $stagedLnk = [IO.Path]::Combine($stageDirectory, [IO.Path]::GetFileName($destLnk))
+            [IO.File]::Copy($LnkPath, $stagedLnk)
+            $icoBytes = Set-OwnAdsIcon $stagedLnk $destLnk
+            # A shortcut keeps 259 characters of icon location : the pinned path plus ":icon-XXXXXXXX.ico"
+            if ($null -ne $icoBytes -and $destLnk.Length + 18 -gt $script:MaxTargetPath) {
+                throw "The pinned shortcut's name is too long for its embedded icon : $([IO.Path]::GetFileName($destLnk))"
+            }
+            $stagedBytes = [IO.File]::ReadAllBytes($stagedLnk)
+            $ownedWrite = [TaskbarPinHelper]::WriteOwnedFile($destLnk, $stagedBytes, $destFileExists, $originalBytes)
+            $fileWritten = $ownedWrite.Created -or $ownedWrite.Changed
+            $rollbackExpectedBytes = $ownedWrite.ExpectedBytes
+            $fileOwnershipUncertain = $ownedWrite.Uncertain
+            if ($null -ne $ownedWrite.Error) {
+                throw $ownedWrite.Error
+            }
+            $shortcutChanged = $ownedWrite.Changed
+            if ($null -ne $icoBytes) {
+                $streamName = [ShortcutHelper]::IconStreamName($icoBytes)
+                if ([AdsHelper]::GetStreamLength($destLnk, $streamName) -ne $icoBytes.Length) {
+                    Write-AdsIcon -FilePath $destLnk -IcoBytes $icoBytes
+                    $shortcutChanged = $true
+                }
+            }
+            if ($destFileExists -and $shortcutChanged) {
+                [TaskbarPinHelper]::KeepNewWriteTime($destLnk, $previousWriteTime)
+            }
+            $destAppId = [TaskbarPinHelper]::GetShortcutAppId($destLnk)
+            if (-not (Test-StringEmpty $destAppId)) {
+                $appId = $destAppId
+            }
+            $blobEntry = [TaskbarPinHelper]::GetBlobEntryEx($destLnk, $appId)
+            if ($null -eq $blobEntry) {
+                $blobEntry = [TaskbarPinHelper]::GetBlobEntryFs($destLnk, $appId)
+            }
+            $record = [TaskbarPinHelper]::GetEntryResolveRecord($blobEntry)
+            $state = Set-ShortcuteriePinState $key $destLnk $appId $blobEntry $record
+            $committed = $true
+        } catch {
+            if ($fileWritten -and -not $committed -and -not $script:TaskbarPinStateUncertain -and -not $fileOwnershipUncertain) {
+                try {
+                    Restore-ShortcuteriePinFile $destLnk $destFileExists $originalBytes $previousWriteTime $rollbackExpectedBytes
+                } catch {
+                    Write-Log "Pinned shortcut rollback failed : $($_.Exception.Message)" -Level Error
+                }
+            }
+            throw
+        } finally {
+            if ($null -ne $key) {
+                $key.Close()
+                $key = $null
+            }
+            [TaskbarPinHelper]::ReleasePinMutex()
+            $mutexAcquired = $false
         }
-        catch { Write-Log "Taskbar pin : failed to update IconLocation : $($_.Exception.Message)" -Level Warning }
-    }
-    # Build serialized PIDL blob entry
-    $blobEntry = [TaskbarPinHelper]::GetBlobEntryEx($destLnk, $beef001d)
-    if (-not $blobEntry) {
-        $blobEntry = [TaskbarPinHelper]::GetBlobEntryFs($destLnk, $beef001d)
-    }
-    if (-not $blobEntry) {
-        Write-Log "Failed to build blob entry for : $destLnk" -Level Error
-        # Only clean up a file WE just created : never delete a pre-existing live pin.
-        if (-not $destAlreadyPinned) { try { [IO.File]::Delete($destLnk) } catch {} }
+        if ($state.Changed) {
+            [TaskbarPinHelper]::SendPinNotify()
+        }
+        if ($destinationActive -and $shortcutChanged) {
+            [TaskbarPinHelper]::NotifyShortcutChanged($destLnk)
+        }
+        # The icon stream the pinned shortcut no longer uses is removed.
+        if ($null -ne $previousIcon -and $previousIcon.StreamName -ne $streamName -and
+            [string]::Equals($previousIcon.HostPath, $destLnk, [StringComparison]::OrdinalIgnoreCase)) {
+            try {
+                $currentIcon = Split-AdsIconLocation ([ShortcutHelper]::GetIconPath($destLnk))
+                $oldStreamIsUsed = $null -ne $currentIcon -and $currentIcon.StreamName -eq $previousIcon.StreamName -and
+                    [string]::Equals($currentIcon.HostPath, $destLnk, [StringComparison]::OrdinalIgnoreCase)
+                if (-not $oldStreamIsUsed) {
+                    $null = [AdsHelper]::DeleteStream($destLnk, $previousIcon.StreamName)
+                }
+            } catch {
+                Write-Log "Pinned icon stream kept : $($_.Exception.Message)" -Level Warning
+            }
+        }
+        $script:LastPinnedTaskbarFile = [IO.Path]::GetFileName($destLnk)
+        $script:LastPinnedConfigKey = $pinConfigKey
+        Write-Log "Taskbar pin has a complete resolution cache : $destLnk" -Level Info
+        return $true
+    } catch {
+        Write-Log "Taskbar pin failed : $($_.Exception.Message)" -Level Error
         return $false
-    }
-    # Inject into registry Favorites blob
-    $mutexAcquired = [TaskbarPinHelper]::AcquirePinMutex(5000)
-    if (-not $mutexAcquired) { Write-Log 'Pin mutex timeout' -Level Error; return $false }
-    try {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($regSubKey, $true)
-        if (-not $key) {
-            Write-Log "Cannot open Taskband registry key for writing" -Level Error
-            return $false
+    } finally {
+        if ($null -ne $key) {
+            $key.Close()
         }
+        if ($mutexAcquired) {
+            [TaskbarPinHelper]::ReleasePinMutex()
+        }
+        $script:TaskbarPinBusy = $false
         try {
-            $doNotExpand = [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames
-            $favBlob = $key.GetValue('Favorites', $null, $doNotExpand)
-            if (-not $favBlob -or $favBlob.Length -lt 2) { $favBlob = [byte[]]@(0xFF) }
-            # Check if already pinned
-            $fileName = [IO.Path]::GetFileName($destLnk)
-            if ([TaskbarPinHelper]::FindBlobEntry($favBlob, $fileName) -ge 0) {
-                Write-Log "Already pinned : $fileName" -Level Info
-                return $true
-            }
-            # Find insertion point (before 0xFF terminator)
-            $insertPos = 0
-            while ($insertPos -lt $favBlob.Length -and $favBlob[$insertPos] -ne 0xFF) {
-                if ($insertPos + 5 -gt $favBlob.Length) { break }
-                $pidlSize = [BitConverter]::ToUInt32($favBlob, $insertPos + 1)
-                $insertPos += 1 + 4 + $pidlSize
-            }
-            # Assemble new blob
-            $ms = New-Object System.IO.MemoryStream
-            if ($insertPos -gt 0) { $ms.Write($favBlob, 0, $insertPos) }
-            $ms.Write($blobEntry, 0, $blobEntry.Length)
-            $ms.WriteByte(0xFF)
-            $newBlob = $ms.ToArray()
-            $ms.Dispose()
-            $changes = [int]$key.GetValue('FavoritesChanges', 0, $doNotExpand)
-            $key.SetValue('Favorites',        $newBlob,          [Microsoft.Win32.RegistryValueKind]::Binary)
-            $key.SetValue('FavoritesVersion',  3,                [Microsoft.Win32.RegistryValueKind]::DWord)
-            $key.SetValue('FavoritesChanges', ($changes + 1),   [Microsoft.Win32.RegistryValueKind]::DWord)
-            Write-Log "Taskbar pin injected : $fileName ($($blobEntry.Length) bytes)" -Level Info
+            Remove-PinStagingDirectory $stageDirectory
+        } catch {
+            Write-Log "Pin staging cleanup failed : $($_.Exception.Message)" -Level Warning
         }
-        finally { $key.Close() }
     }
-    finally {
-        if ($mutexAcquired) { [TaskbarPinHelper]::ReleasePinMutex() }
+}
+
+# ── The icon Windows gives a shortcut to the target that has no icon of its own, or $null ──
+function Get-TargetDefaultPreview {
+    param([string]$TargetPath)
+    if ((Test-StringEmpty $TargetPath) -or $script:IsUrlTarget) { return $null }
+    if ($script:ShellTargetRegex.IsMatch($TargetPath.TrimStart())) {
+        # Cached icon first (set during a shell item drop), then live resolution
+        if ($null -ne $script:ShellTargetIconCache) { return New-Object System.Drawing.Bitmap($script:ShellTargetIconCache) }
+        return [ShellDropHelper]::ExtractIconFromShellPath($TargetPath)
     }
-    [TaskbarPinHelper]::SendPinNotify()
-    return $true
+    # A shortcut's target may hold environment variables ("%windir%\notepad.exe")
+    $path = [Environment]::ExpandEnvironmentVariables($TargetPath)
+    try { $ext = [IO.Path]::GetExtension($path).ToLower() } catch { return $null }
+    # An executable's first icon; a .cpl, like any other file or folder, the shell's icon
+    # (the one Windows actually assigns to the shortcut)
+    if ($ext -ne '.cpl' -and $script:ExeExtensions -contains $ext -and [IO.File]::Exists($path)) {
+        return [IcoBuilder]::ExtractBitmapAtSize($path, 0, [IcoBuilder]::GetMaxNativeSize($path, 0))
+    }
+    if ([IO.File]::Exists($path) -or [IO.Directory]::Exists($path)) {
+        return [IconResolver]::ExtractShellIcon($path)
+    }
+    return $null
 }
 
 # ── Update the icon preview display ──
@@ -2725,33 +3765,7 @@ function Update-IconPreview {
     $newBmp = $null
     if ($radioIcon_TargetDefault.Checked) {
         $targetPath = Get-CleanInput $textTarget.Text
-        if (-not (Test-StringEmpty $targetPath) -and -not $script:IsUrlTarget) {
-            if ($script:ShellTargetRegex.IsMatch($targetPath.TrimStart())) {
-                # Try cached icon first (set during shell item drop), then live resolution
-                if ($null -ne $script:ShellTargetIconCache) {
-                    $newBmp = New-Object System.Drawing.Bitmap($script:ShellTargetIconCache)
-                }
-                else {
-                    $newBmp = [ShellDropHelper]::ExtractIconFromShellPath($targetPath)
-                }
-            }
-            else {
-                $ext = [IO.Path]::GetExtension($targetPath).ToLower()
-                if ($ext -eq '.cpl') {
-                    # .cpl in Target Default : show the shell icon Windows would actually assign to the shortcut
-                    if ([IO.File]::Exists($targetPath)) {
-                        $newBmp = [IconResolver]::ExtractShellIcon($targetPath)
-                    }
-                }
-                elseif ($script:ExeExtensions -contains $ext -and [IO.File]::Exists($targetPath)) {
-                    $maxN = [IcoBuilder]::GetMaxNativeSize($targetPath, 0)
-                    $newBmp = [IcoBuilder]::ExtractBitmapAtSize($targetPath, 0, $maxN)
-                }
-                elseif ([IO.File]::Exists($targetPath) -or [IO.Directory]::Exists($targetPath)) {
-                    $newBmp = [IconResolver]::ExtractShellIcon($targetPath)
-                }
-            }
-        }
+        $newBmp = Get-TargetDefaultPreview $targetPath
         if ($null -ne $newBmp) {
             $labelPreviewIconInfo.Text = "$($newBmp.Width) x $($newBmp.Height) px (default)"
             Write-Log "Icon preview updated from target default : $targetPath ($($newBmp.Width)x$($newBmp.Height))" -Level Debug
@@ -2774,30 +3788,7 @@ function Update-IconPreview {
         $filePath = Get-CleanInput $iconPathTextbox.Text
         if (Test-StringEmpty $filePath) {
             # Empty icon path : show target default preview as a hint
-            $targetPath = Get-CleanInput $textTarget.Text
-            if (-not (Test-StringEmpty $targetPath) -and -not $script:IsUrlTarget) {
-                if ($script:ShellTargetRegex.IsMatch($targetPath.TrimStart())) {
-                    if ($null -ne $script:ShellTargetIconCache) {
-                        $newBmp = New-Object System.Drawing.Bitmap($script:ShellTargetIconCache)
-                    }
-                    else {
-                        $newBmp = [ShellDropHelper]::ExtractIconFromShellPath($targetPath)
-                    }
-                }
-                else {
-                    $ext = [IO.Path]::GetExtension($targetPath).ToLower()
-                    if ($ext -eq '.cpl') {
-                        if ([IO.File]::Exists($targetPath)) { $newBmp = [IconResolver]::ExtractShellIcon($targetPath) }
-                    }
-                    elseif ($script:ExeExtensions -contains $ext -and [IO.File]::Exists($targetPath)) {
-                        $maxN = [IcoBuilder]::GetMaxNativeSize($targetPath, 0)
-                        $newBmp = [IcoBuilder]::ExtractBitmapAtSize($targetPath, 0, $maxN)
-                    }
-                    elseif ([IO.File]::Exists($targetPath) -or [IO.Directory]::Exists($targetPath)) {
-                        $newBmp = [IconResolver]::ExtractShellIcon($targetPath)
-                    }
-                }
-            }
+            $newBmp = Get-TargetDefaultPreview (Get-CleanInput $textTarget.Text)
             if ($null -ne $newBmp) {
                 $labelPreviewIconInfo.Text = "$($newBmp.Width) x $($newBmp.Height) px (default)"
             }
@@ -2812,6 +3803,10 @@ function Update-IconPreview {
                 $showIndex = ($script:ExeExtensions -contains $ext) -and ($script:CurrentExeIconCount -gt 1 -or $script:CurrentIconIndex -ne 0)
                 $labelPreviewIconInfo.Text = if ($showIndex) { "$($newBmp.Width) x $($newBmp.Height) px (index $($script:CurrentIconIndex))" }
                                          else            { "$($newBmp.Width) x $($newBmp.Height) px" }
+                # A .url references its icon file : an image cannot be one (Create stays disabled)
+                if ($script:IsUrlTarget -and $script:StandardIconExt -notcontains $ext) {
+                    $labelPreviewIconInfo.Text = 'A .url needs an .ico, .exe or .dll icon'
+                }
                 Write-Log "Icon preview updated from file : $filePath index $($script:CurrentIconIndex) ($($newBmp.Width)x$($newBmp.Height))" -Level Debug
             }
             else {
@@ -2842,7 +3837,8 @@ function Update-IconPreview {
     finally {
         Set-ControlRedraw $btnIconPreview $true
     }
-    Update-CreateButtonState
+    # Debounced : the button state reads the pin list, not to be done at every keystroke
+    Request-CreateButtonUpdate
 }
 
 # ── Dispose the icon index menu items and their images ──
@@ -2864,8 +3860,7 @@ function Update-IconIndexMenu {
     # Negative resource IDs are a specific icon reference, not a browsable index
     if ($script:CurrentIconIndex -lt 0) { $btnIconPreview.Invalidate(); return }
     $filePath = Get-CleanInput $iconPathTextbox.Text
-    if (Test-StringEmpty $filePath) { $script:LastIconMenuPath = ""; $btnIconPreview.Invalidate(); return }
-    $script:LastIconMenuPath = $filePath
+    if (Test-StringEmpty $filePath) { $btnIconPreview.Invalidate(); return }
     if (-not [IO.File]::Exists($filePath)) { $btnIconPreview.Invalidate(); return }
     $ext = [IO.Path]::GetExtension($filePath).ToLower()
     if ($script:ExeExtensions -notcontains $ext) { $btnIconPreview.Invalidate(); return }
@@ -2922,7 +3917,7 @@ function Update-ArgsLength {
     else {
         $labelArgsLen.ForeColor = if ($script:IsDarkMode) { [System.Drawing.Color]::FromArgb(140,140,140) } else { [System.Drawing.Color]::Gray }
     }
-    # Explorer combined length warning (Target + space + Arguments > 260)
+    # Explorer combined length warning (Target + space + Arguments longer than the Properties field)
     $targetLen = (Get-CleanInput $textTarget.Text).Length
     $combinedLen = $targetLen + 1 + $len
     if ($targetLen -eq 0) { $combinedLen = $len }
@@ -2930,8 +3925,8 @@ function Update-ArgsLength {
         $labelExplorerWarn.Text = "Args > $script:MaxArgsCmdExe chars. May fail if launched via CMD."
         $labelExplorerWarn.ForeColor = [System.Drawing.Color]::FromArgb(220, 160, 0)
     }
-    elseif ($combinedLen -gt 260) {
-        $labelExplorerWarn.Text = "Full Target = $combinedLen/260. Not editable from Properties"
+    elseif ($combinedLen -gt $script:MaxTargetPath) {
+        $labelExplorerWarn.Text = "Full Target = $combinedLen/$($script:MaxTargetPath). Not editable from Properties"
         $labelExplorerWarn.ForeColor = [System.Drawing.Color]::FromArgb(220, 160, 0)
     }
     else {
@@ -2956,17 +3951,54 @@ function Update-CreateButtonState {
             $iconValid = ($script:ExeExtensions -contains $ext) -or ($script:ImageExtensions -contains $ext)
         }
     }
-    $lnkFilled = -not (Test-StringEmpty $textLnkPath.Text)
-    $argsOk    = $textArgs.Text.Length -le $script:MaxArgsCreateProcess
+    # Shortcut location : a full path ("test.lnk" alone would have no folder to go to)
     $lnkPath   = Get-CleanInput $textLnkPath.Text
-    $lnkExists = (-not (Test-StringEmpty $lnkPath)) -and [System.IO.File]::Exists($lnkPath)
-    # Target validation : must have content (or existing lnk) + must respect 260 char limit
+    $lnkFilled = $lnkPath -match '^([a-zA-Z]:\\|\\\\[^\\])'
+    # A shortcut keeps at most 259 characters of icon location : its own path plus
+    # ":icon-XXXXXXXX.ico" (18) for an embedded icon, the icon file's path otherwise
+    $iconLocationOk = $true
+    $lnkHint = $null
+    $iconGiven = if ($radioIcon_Base64.Checked) { -not (Test-StringEmpty $TextboxIcon_Base64.Text) } else { -not (Test-StringEmpty $iconPathTextbox.Text) }
+    if (-not $script:IsUrlTarget -and -not $radioIcon_TargetDefault.Checked -and $iconGiven) {
+        if ($radioIcon_Base64.Checked -or $radioEmbedIcon.Checked) {
+            $lnkLength = $lnkPath.Length + $(if ($lnkPath.EndsWith('.lnk', [StringComparison]::OrdinalIgnoreCase)) { 0 } else { 4 })
+            if ($lnkLength + 18 -gt $script:MaxTargetPath) {
+                $iconLocationOk = $false
+                $lnkHint = "Shortcut path too long for an embedded icon : $lnkLength / $($script:MaxTargetPath - 18) characters"
+            }
+        }
+        elseif ((Get-CleanInput $iconPathTextbox.Text).Length -gt $script:MaxTargetPath) {
+            $iconLocationOk = $false
+            $lnkHint = "Icon file path too long for a shortcut : $((Get-CleanInput $iconPathTextbox.Text).Length) / $($script:MaxTargetPath) characters"
+        }
+    }
+    if (-not $lnkFilled -and $lnkPath.Length -gt 0) {
+        $lnkHint = 'A full path is needed, e.g. C:\Users\...\Desktop\Name.lnk'
+    }
+    if ($null -ne $lnkHint) {
+        $labelLnkInfo.Text = $lnkHint
+        $labelLnkInfo.ForeColor = [System.Drawing.Color]::FromArgb(220, 160, 0)
+    }
+    elseif ($null -ne $script:LnkHintShown -and $labelLnkInfo.Text -eq $script:LnkHintShown) {
+        $labelLnkInfo.Text = ''
+    }
+    $script:LnkHintShown = $lnkHint
+    $argsOk    = $textArgs.Text.Length -le $script:MaxArgsCreateProcess
+    # A .url references its icon file : only an .ico, .exe or .dll can be one
+    $urlIconOk = $true
+    if ($script:IsUrlTarget -and $radioIcon_AnyFile.Checked) {
+        $urlIconPath = Get-CleanInput $iconPathTextbox.Text
+        if ($urlIconPath.Length -gt 0) {
+            try { $urlIconOk = $script:StandardIconExt -contains [IO.Path]::GetExtension($urlIconPath).ToLower() } catch { $urlIconOk = $false }
+        }
+    }
+    # Target validation : must have content + must respect the target length limit
     $targetLen    = (Get-CleanInput $textTarget.Text).Length
     $targetOk     = ($targetLen -gt 0)
     $targetLenOk  = $script:IsShellTarget -or $script:IsUrlTarget -or ($targetLen -le $script:MaxTargetPath) -or ($targetLen -eq 0)
-    # AUMID validation
+    # AUMID validation (a disabled AUMID is not written, see Get-ActiveAumid)
     $aumidOk   = $true
-    $aumidText = $textAumid.Text
+    $aumidText = Get-ActiveAumid
     if ($aumidText.Length -gt 0) {
         if ($aumidText[0] -eq '.' -or $aumidText[$aumidText.Length - 1] -eq '.' -or
             $script:AumidCleanRegex.IsMatch($aumidText)) {
@@ -2974,7 +4006,7 @@ function Update-CreateButtonState {
         }
     }
     $iconRequired = -not $script:IsUrlTarget
-    $btnCreate.Enabled = ((-not $iconRequired -or $iconValid) -and $lnkFilled -and $argsOk -and $targetOk -and $targetLenOk -and $aumidOk)
+    $btnCreate.Enabled = ((-not $iconRequired -or $iconValid) -and $urlIconOk -and $iconLocationOk -and $lnkFilled -and $argsOk -and $targetOk -and $targetLenOk -and $aumidOk)
     if ($btnCreate.Enabled) {
         $btnCreate.BackColor = [System.Drawing.Color]::FromArgb(0, 120, 212)
         $btnCreate.ForeColor = [System.Drawing.Color]::White
@@ -2988,36 +4020,26 @@ function Update-CreateButtonState {
 
 function Update-PinButtonState {
     $hasTarget = -not (Test-StringEmpty $textTarget.Text)
-    $btnPin.Enabled = $hasTarget
-    if ($btnPin.Enabled) {
-        # Check if the shortcut is already pinned (by filename, always .lnk in taskbar)
+    $btnPin.Enabled = $hasTarget -and -not $script:PinButtonBusy -and -not $script:TaskbarPinBusy
+    $alreadyPinned = $false
+    if ($hasTarget) {
         $taskBarDir = [IO.Path]::Combine($env:APPDATA, 'Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar')
-        $alreadyPinned = $false
         try {
-            $lnkPath = Get-CleanInput $textLnkPath.Text
-            $fileName = if (-not (Test-StringEmpty $lnkPath)) { [IO.Path]::ChangeExtension([IO.Path]::GetFileName($lnkPath), '.lnk') }
-                        else { [IO.Path]::GetFileNameWithoutExtension((Get-CleanInput $textTarget.Text)) + '.lnk' }
-            $pinnedPath = [IO.Path]::Combine($taskBarDir, $fileName)
-            $alreadyPinned = [IO.File]::Exists($pinnedPath)
+            # The name the Pin button gives the pinned shortcut
+            $fileName = (Get-PinShortcutName (Get-CleanInput $textLnkPath.Text) (Get-CleanInput $textTarget.Text) (Get-ActiveDescription)) + '.lnk'
+            $alreadyPinned = Test-CurrentTaskbarPin ([IO.Path]::Combine($taskBarDir, $fileName))
+        } catch {
+            $alreadyPinned = $false
         }
-        catch { $alreadyPinned = $false }
-        # Fallback for pins whose taskbar filename differs from the derived name
-        # (e.g. a .cpl pinned under its resolved applet name) : trust it ONLY while
-        # the current Target/name still match what was pinned, so editing the target
-        # correctly drops the "Pinned" state instead of leaving it stuck.
         if (-not $alreadyPinned -and -not (Test-StringEmpty $script:LastPinnedTaskbarFile) -and
-            ($script:LastPinnedConfigKey -eq ((Get-CleanInput $textTarget.Text) + '|' + (Get-CleanInput $textLnkPath.Text)))) {
-            $alreadyPinned = [IO.File]::Exists([IO.Path]::Combine($taskBarDir, $script:LastPinnedTaskbarFile))
+            $script:LastPinnedConfigKey -eq ((Get-CleanInput $textTarget.Text) + '|' + (Get-CleanInput $textLnkPath.Text))) {
+            $alreadyPinned = Test-CurrentTaskbarPin ([IO.Path]::Combine($taskBarDir, $script:LastPinnedTaskbarFile))
         }
-        $btnPin.Text = if ($alreadyPinned) { [char]0x2714 + " Pinned" } else { "Pin to Taskbar" }
-        # Lock the button while pinned : re-clicking can only re-pin (never unpin) and
-        # re-pinning a live item risks corrupting it. Unpin from the taskbar instead --
-        # editing the target/name or an external unpin re-enables the button (the
-        # form's Activated handler refreshes this state on focus).
-        if ($alreadyPinned) { $btnPin.Enabled = $false }
     }
-    else {
-        $btnPin.Text = "Pin to Taskbar"
+    if ($alreadyPinned) {
+        $btnPin.Text = 'Update Pin'
+    } else {
+        $btnPin.Text = 'Pin to Taskbar'
     }
 }
 
@@ -3075,6 +4097,8 @@ function Set-SpecialTargetMode {
             }
         }
         $labelLnkPath.Text = if ($IsActive) { "Shortcut location (.url) :" } else { "Shortcut location (.lnk) :" }
+        # The preview says whether the icon file suits a .url
+        Update-IconPreview
     }
     Write-Log "$ModeName target mode : $(if ($IsActive) {'ON'} else {'OFF'})" -Level Debug
 }
@@ -3087,15 +4111,46 @@ function New-UrlShortcut {
         [string]$IconFile = '',
         [int]$IconIndex = 0
     )
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add('[InternetShortcut]')
-    $lines.Add("URL=$Url")
-    if (-not (Test-StringEmpty $IconFile)) {
-        $lines.Add("IconFile=$IconFile")
-        $lines.Add("IconIndex=$IconIndex")
-    }
-    [IO.File]::WriteAllLines($FilePath, $lines.ToArray(), [System.Text.Encoding]::Default)
+    $iconLocation = if (Test-StringEmpty $IconFile) { '' } else { $IconFile }
+    [ShortcutHelper]::CreateUrlShortcut($FilePath, $Url, $iconLocation, $IconIndex)
     Write-Log "URL shortcut created : $FilePath -> $Url" -Level Debug
+}
+
+# ── URL and icon of a .url file ──
+# The URL is read by Windows' own object. The icon, and the URL when that object cannot
+# load the file, come from the file's text : Windows writes each value in the ANSI section
+# and, in UTF-7, in [InternetShortcut.W] ; that Unicode copy is used while its ANSI form is
+# still the ANSI value (an editor that only knows ANSI may have changed that one since).
+function Read-UrlShortcut {
+    param([string]$Path)
+    $sections = @{}
+    $section = ''
+    foreach ($line in [IO.File]::ReadAllLines($Path, [System.Text.Encoding]::Default)) {
+        $trimmed = $line.Trim()
+        if ($trimmed.StartsWith('[') -and $trimmed.EndsWith(']')) { $section = $trimmed; continue }
+        $equals = $trimmed.IndexOf('=')
+        if ($equals -lt 1) { continue }
+        if (-not $sections.ContainsKey($section)) { $sections[$section] = @{} }
+        $sections[$section][$trimmed.Substring(0, $equals).Trim()] = $trimmed.Substring($equals + 1).Trim()
+    }
+    $ansi = if ($sections.ContainsKey('[InternetShortcut]'))   { $sections['[InternetShortcut]'] }   else { @{} }
+    $wide = if ($sections.ContainsKey('[InternetShortcut.W]')) { $sections['[InternetShortcut.W]'] } else { @{} }
+    $readValue = {
+        param([string]$Name)
+        $value = [string]$ansi[$Name]
+        if ($wide.ContainsKey($Name)) {
+            $decoded = [System.Text.Encoding]::UTF7.GetString([System.Text.Encoding]::ASCII.GetBytes([string]$wide[$Name]))
+            if ([System.Text.Encoding]::Default.GetString([System.Text.Encoding]::Default.GetBytes($decoded)) -ceq $value) { $value = $decoded }
+        }
+        return $value
+    }
+    $url = $null
+    try { $url = [ShortcutHelper]::ReadUrlShortcut($Path) }
+    catch { Write-Log "  .url read by the shell failed ($($_.Exception.Message)) : reading its text" -Level Debug }
+    if ($null -eq $url) { $url = & $readValue 'URL' }
+    $iconIndex = 0
+    [void][int]::TryParse([string]$ansi['IconIndex'], [ref]$iconIndex)
+    return @{ Url = [string]$url; IconFile = (& $readValue 'IconFile'); IconIndex = $iconIndex }
 }
 
 # ── Determine which drop zone a screen point falls into ──
@@ -3165,13 +4220,10 @@ function Import-ExistingShortcut {
         Write-Log "Importing existing shortcut : $LnkPath"
         if ($importExt -eq '.url') {
             # ── .url internet shortcut (INI format) ──
-            $urlValue = ""; $iconFilePath = ""; $iconFileIndex = 0
-            foreach ($line in [IO.File]::ReadAllLines($LnkPath, [System.Text.Encoding]::Default)) {
-                $trimmed = $line.Trim()
-                if     ($trimmed.StartsWith('URL=',       [System.StringComparison]::OrdinalIgnoreCase)) { $urlValue     = $trimmed.Substring(4).Trim() }
-                elseif ($trimmed.StartsWith('IconFile=',  [System.StringComparison]::OrdinalIgnoreCase)) { $iconFilePath = $trimmed.Substring(9).Trim() }
-                elseif ($trimmed.StartsWith('IconIndex=', [System.StringComparison]::OrdinalIgnoreCase)) { [int]::TryParse($trimmed.Substring(10).Trim(), [ref]$iconFileIndex) | Out-Null }
-            }
+            $urlShortcut   = Read-UrlShortcut $LnkPath
+            $urlValue      = $urlShortcut.Url
+            $iconFilePath  = $urlShortcut.IconFile
+            $iconFileIndex = $urlShortcut.IconIndex
             Write-Log "  URL : $urlValue | IconFile : $iconFilePath | IconIndex : $iconFileIndex" -Level Debug
             # Fill target (triggers URL mode detection via TextChanged)
             $script:SuppressTargetSplit = $true
@@ -3215,8 +4267,10 @@ function Import-ExistingShortcut {
             $existWorkDir  = [ShortcutHelper]::GetWorkingDirectory($LnkPath)
             $existIconPath = [ShortcutHelper]::GetIconPath($LnkPath)
             Write-Log "  Target : $existTarget | Args length : $($existArgs.Length) | WorkDir : $existWorkDir | IconPath : $existIconPath" -Level Debug
-            # Fill right panel fields
-            $textTarget.Text  = $existTarget
+            # Fill right panel fields (a shortcut keeps its arguments apart : no split of its target)
+            $script:SuppressTargetSplit = $true
+            try { $textTarget.Text = $existTarget }
+            finally { $script:SuppressTargetSplit = $false }
             $textArgs.Text    = $existArgs
             $textWorkDir.Text = $existWorkDir
             # Resolve PIDL-based shell shortcuts (Control Panel, Recycle Bin, etc.)
@@ -3264,13 +4318,13 @@ function Import-ExistingShortcut {
                 Write-Log "  Could not read AUMID : $($_.Exception.Message)" -Level Warning
             }
             # Fill left panel (icon)
-            $isAdsIcon = (-not (Test-StringEmpty $existIconPath)) -and $existIconPath.EndsWith(":icon.ico", [System.StringComparison]::OrdinalIgnoreCase)
-            if ($isAdsIcon) {
-                $adsHostPath = $existIconPath.Substring(0, $existIconPath.Length - ":icon.ico".Length)
+            $adsIcon = Split-AdsIconLocation $existIconPath
+            if ($null -ne $adsIcon) {
+                $adsHostPath = $adsIcon.HostPath
                 $adsBytes = $null
                 foreach ($adsSource in @($adsHostPath, $LnkPath)) {
                     if ((-not (Test-StringEmpty $adsSource)) -and [IO.File]::Exists($adsSource)) {
-                        $adsBytes = [AdsHelper]::ReadStream($adsSource, "icon.ico")
+                        $adsBytes = [AdsHelper]::ReadStream($adsSource, $adsIcon.StreamName)
                         if ($null -ne $adsBytes -and $adsBytes.Length -gt 0) {
                             Write-Log "  ADS icon read from : $adsSource ($($adsBytes.Length) bytes)" -Level Debug
                             break
@@ -3298,8 +4352,10 @@ function Import-ExistingShortcut {
                     catch { $importIconIndex = 0 }
                     # Detect self-reference
                     $importTarget = Get-CleanInput $textTarget.Text
+                    # The target's own first icon is what "Target" gives; another of its icons is kept
                     $isSelfReference = (-not (Test-StringEmpty $cleanIconPath)) -and
                                       (-not (Test-StringEmpty $importTarget)) -and
+                                      $importIconIndex -eq 0 -and
                                       [string]::Equals($cleanIconPath, $importTarget, [System.StringComparison]::OrdinalIgnoreCase)
                     if ($isSelfReference -or (Test-StringEmpty $cleanIconPath)) {
                         $radioIcon_TargetDefault.Checked = $true
@@ -3388,7 +4444,8 @@ function Set-ResolvedIconSource {
 
 # ── Resolve the icon of any file and fill the left panel accordingly ──
 function Resolve-FileIcon {
-    param([string]$FilePath)
+    # Depth : shortcuts followed so far (two shortcuts may point to each other)
+    param([string]$FilePath, [int]$Depth = 0)
     if (-not [IO.File]::Exists($FilePath)) { return }
     $ext = [IO.Path]::GetExtension($FilePath).ToLower()
     # ── Direct file types (image / executable) ──
@@ -3399,13 +4456,14 @@ function Resolve-FileIcon {
         $iconPath = [ShortcutHelper]::GetIconPath($FilePath)
         Write-Log "  .lnk IconPath : '$iconPath'" -Level Debug
         # ADS-embedded icon (only case where base64 is truly unavoidable)
-        if ((-not (Test-StringEmpty $iconPath)) -and $iconPath.EndsWith(':icon.ico', [System.StringComparison]::OrdinalIgnoreCase)) {
-            $adsHostPath = $iconPath.Substring(0, $iconPath.Length - ":icon.ico".Length)
+        $adsIcon = Split-AdsIconLocation $iconPath
+        if ($null -ne $adsIcon) {
+            $adsHostPath = $adsIcon.HostPath
             $adsBytes = $null
             # Try the referenced ADS host first, then the dropped LNK itself as fallback
             foreach ($adsSource in @($adsHostPath, $FilePath)) {
                 if ((-not (Test-StringEmpty $adsSource)) -and [IO.File]::Exists($adsSource)) {
-                    $adsBytes = [AdsHelper]::ReadStream($adsSource, "icon.ico")
+                    $adsBytes = [AdsHelper]::ReadStream($adsSource, $adsIcon.StreamName)
                     if ($null -ne $adsBytes -and $adsBytes.Length -gt 0) {
                         Write-Log "  ADS icon read from : $adsSource ($($adsBytes.Length) bytes)" -Level Debug
                         break
@@ -3429,8 +4487,12 @@ function Resolve-FileIcon {
         # Recurse into shortcut target
         $lnkTarget = [ShortcutHelper]::GetTargetPath($FilePath)
         if ((-not (Test-StringEmpty $lnkTarget)) -and [IO.File]::Exists($lnkTarget)) {
+            if ($Depth -ge 8) {
+                Write-Log "Icon fallback stopped : shortcuts lead back to each other ($FilePath)" -Level Warning
+                return
+            }
             Write-Log "Icon fallback to .lnk target : $lnkTarget" -Level Debug
-            Resolve-FileIcon $lnkTarget
+            Resolve-FileIcon $lnkTarget ($Depth + 1)
         }
         else {
             # PIDL-based shortcut (Control Panel, shell folders, etc.)
@@ -3482,12 +4544,9 @@ function Resolve-FileIcon {
     if ($ext -eq '.url') {
         Write-Log "Resolving icon for .url : $FilePath" -Level Debug
         try {
-            $iconFilePath = $null; $iconFileIndex = 0
-            foreach ($line in [IO.File]::ReadAllLines($FilePath, [System.Text.Encoding]::Default)) {
-                $trimmed = $line.Trim()
-                if     ($trimmed.StartsWith('IconFile=',  [System.StringComparison]::OrdinalIgnoreCase)) { $iconFilePath  = $trimmed.Substring(9).Trim() }
-                elseif ($trimmed.StartsWith('IconIndex=', [System.StringComparison]::OrdinalIgnoreCase)) { [int]::TryParse($trimmed.Substring(10).Trim(), [ref]$iconFileIndex) | Out-Null }
-            }
+            $urlShortcut   = Read-UrlShortcut $FilePath
+            $iconFilePath  = $urlShortcut.IconFile
+            $iconFileIndex = $urlShortcut.IconIndex
             if (-not (Test-StringEmpty $iconFilePath)) {
                 if (Set-ResolvedIconSource ([System.Environment]::ExpandEnvironmentVariables($iconFilePath)) $iconFileIndex) { return }
             }
@@ -3588,9 +4647,22 @@ function Resolve-FileIcon {
     Write-Log "Could not resolve icon for : $FilePath" -Level Warning
 }
 
-# Resolve a .cpl file to its Control Panel namespace item (shell path + display name)
+# Full path of a .cpl : as given when it exists, else in System32 ("main.cpl")
+function Get-CplFullPath {
+    param([string]$CplFilePath)
+    if ([IO.File]::Exists($CplFilePath)) { return $CplFilePath }
+    try { $candidate = [IO.Path]::Combine([Environment]::SystemDirectory, [IO.Path]::GetFileName($CplFilePath)) } catch { return $CplFilePath }
+    if ([IO.File]::Exists($candidate)) { return $candidate }
+    return $CplFilePath
+}
+
+# Resolve a .cpl file to its Control Panel namespace item (shell path + display name).
+# Each item is looked up once per session : walking the Control Panel takes about 400 ms.
 function Resolve-CplControlPanelItem {
     param([string]$CplFilePath)
+    $CplFilePath = Get-CplFullPath $CplFilePath
+    $cacheKey = $CplFilePath.ToLowerInvariant()
+    if ($script:CplItemCache.ContainsKey($cacheKey)) { return $script:CplItemCache[$cacheKey] }
     $CplFileName = [IO.Path]::GetFileName($CplFilePath).ToLower()
     $CplBaseName = [IO.Path]::GetFileNameWithoutExtension($CplFilePath).ToLower()
     $CplShellApp = New-Object -ComObject Shell.Application
@@ -3621,6 +4693,7 @@ function Resolve-CplControlPanelItem {
     }
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($CplNamespace)
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($CplShellApp)
+    $script:CplItemCache[$cacheKey] = $MatchedResult
     return $MatchedResult
 }
 
@@ -3676,6 +4749,9 @@ function Split-TargetAndArguments {
     # ── Case 3 : No extension found, try to resolve first token via PATH ──
     $spaceIdx = $raw.IndexOf(' ')
     if ($spaceIdx -gt 0) {
+        if ($null -eq $script:PathDirs) {
+            $script:PathDirs = @(([string]$env:PATH).Split(';') | Where-Object { $_.Length -gt 0 -and [IO.Directory]::Exists($_) })
+        }
         $firstToken = $raw.Substring(0, $spaceIdx)
         $argsStart  = $spaceIdx + 1
         # Check if the bare token resolves to an executable in any PATH directory
@@ -3701,6 +4777,9 @@ function Split-TargetAndArguments {
 function Invoke-TargetSplit {
     param([string]$Text)
     if ($Text -eq $script:DeclinedSplitText) { return }
+    # A whole existing path is a target, even with ".com " or ".exe " in a folder name
+    $wholePath = Get-CleanInput $Text
+    if ([IO.File]::Exists($wholePath) -or [IO.Directory]::Exists($wholePath)) { return }
     $parsed = Split-TargetAndArguments $Text
     if (Test-StringEmpty $parsed.Arguments) { return }
     $existingArgs = $textArgs.Text
@@ -3796,13 +4875,10 @@ function Invoke-ZoneDrop {
             }
             elseif ($ext -eq '.url') {
                 try {
-                    foreach ($line in [IO.File]::ReadAllLines($FilePath, [System.Text.Encoding]::Default)) {
-                        $trimmed = $line.Trim()
-                        if ($trimmed.StartsWith('URL=', [System.StringComparison]::OrdinalIgnoreCase)) {
-                            $textTarget.Text = $trimmed.Substring(4).Trim()
-                            Write-Log "Target resolved from .url : $($textTarget.Text)"
-                            break
-                        }
+                    $urlValue = (Read-UrlShortcut $FilePath).Url
+                    if (-not (Test-StringEmpty $urlValue)) {
+                        $textTarget.Text = $urlValue
+                        Write-Log "Target resolved from .url : $urlValue"
                     }
                 }
                 catch { Write-Log "Error reading .url for target : $($_.Exception.Message)" -Level Warning }
@@ -3871,15 +4947,18 @@ function Invoke-ZoneDrop {
             $hasExistingFields = -not (Test-StringEmpty (Get-CleanInput $textTarget.Text))
             if ($hasExistingFields) { $script:SuppressAutoFill = $true }
             try {
+                $shortcutExt = if ($script:IsUrlTarget) { '.url' } else { '.lnk' }
                 if ($ext -eq '.lnk' -or $ext -eq '.url') {
                     $textLnkPath.Text = $FilePath
                 }
                 elseif ([System.IO.Directory]::Exists($FilePath)) {
-                    $textLnkPath.Text = $FilePath
+                    # A folder is where the shortcut goes, named after the target
+                    $shortcutName = Get-TargetShortcutName (Get-CleanInput $textTarget.Text) (Get-ActiveDescription)
+                    $textLnkPath.Text = [System.IO.Path]::Combine($FilePath, $shortcutName + $shortcutExt)
                 }
                 else {
                     $lnkDir  = [System.IO.Path]::GetDirectoryName($FilePath)
-                    $lnkName = [System.IO.Path]::GetFileNameWithoutExtension($FilePath) + ".lnk"
+                    $lnkName = [System.IO.Path]::GetFileNameWithoutExtension($FilePath) + $shortcutExt
                     $textLnkPath.Text = [System.IO.Path]::Combine($lnkDir, $lnkName)
                 }
             }
@@ -3895,17 +4974,28 @@ function Invoke-ZoneDrop {
     }
 }
 
-# ── Write ICO bytes to an NTFS Alternate Data Stream ──
+# ── Write ICO bytes to an NTFS Alternate Data Stream named after its content ──
 function Write-AdsIcon {
     param([string]$FilePath, [byte[]]$IcoBytes)
-    [AdsHelper]::WriteStream($FilePath, "icon.ico", $IcoBytes)
-    Write-Log "ADS icon written to : ${FilePath}:icon.ico ($($IcoBytes.Length) bytes)" -Level Debug
+    $streamName = [ShortcutHelper]::IconStreamName($IcoBytes)
+    [AdsHelper]::WriteStream($FilePath, $streamName, $IcoBytes)
+    Write-Log "ADS icon written to : ${FilePath}:$streamName ($($IcoBytes.Length) bytes)" -Level Debug
 }
 
-# ── Verify an NTFS ADS icon stream exists and return its length ──
+# ── Host file and stream name of an icon location in an NTFS ADS, or $null ──
+function Split-AdsIconLocation {
+    param([string]$IconPath)
+    if (Test-StringEmpty $IconPath) { return $null }
+    if ([Environment]::ExpandEnvironmentVariables($IconPath) -match '^(.{3,}):([^\\/:]+)$') { return @{ HostPath = $Matches[1]; StreamName = $Matches[2] } }
+    return $null
+}
+
+# ── Verify the ADS icon stream a shortcut points to exists and return its length ──
 function Get-AdsIconLength {
     param([string]$FilePath)
-    return [AdsHelper]::GetStreamLength($FilePath, "icon.ico")
+    try { $adsIcon = Split-AdsIconLocation ([ShortcutHelper]::GetIconPath($FilePath)) } catch { return -1 }
+    if ($null -eq $adsIcon) { return -1 }
+    return [AdsHelper]::GetStreamLength($adsIcon.HostPath, $adsIcon.StreamName)
 }
 
 # ── Recursive dark scrollbar applicator ──
@@ -3937,18 +5027,20 @@ if (-not (Test-StringEmpty $batFile)) {
     $needsUpdate = $true
     if ([IO.File]::Exists($startMenuLnk)) {
         try {
-            $desc = [ShortcutHelper]::GetDescription($startMenuLnk)
-            if ($desc.Contains('[UserPinned]')) { $script:UserPinnedStartMenu = $true; $needsUpdate = $false }
-            elseif ([ShortcutHelper]::GetTargetPath($startMenuLnk) -eq $batFile) { $needsUpdate = $false }
+            $script:UserPinnedStartMenu = [ShortcutHelper]::GetDescription($startMenuLnk).Contains('[UserPinned]')
+            $needsUpdate = [ShortcutHelper]::GetTargetPath($startMenuLnk) -ne $batFile
         } catch {}
     }
-    if ($needsUpdate -and -not $script:UserPinnedStartMenu) {
+    # A kept shortcut follows the script when it moves, and stays kept
+    if ($needsUpdate) {
+        $startMenuDescription = "$($script:AppName) v$($script:Version)"
+        if ($script:UserPinnedStartMenu) { $startMenuDescription += ' [UserPinned]' }
         try {
             [ShortcutHelper]::CreateWithEmbeddedIcon(
-                $startMenuLnk, $batFile, "", $script:AppIcoBytes, $script:AppId,
-                "$($script:AppName) v$($script:Version)")
+                $startMenuLnk, $batFile, "", $script:AppIcoBytes, $script:AppId, $startMenuDescription)
             Write-AdsIcon -FilePath $startMenuLnk -IcoBytes $script:AppIcoBytes
-            Write-Log "Auto-registered Start Menu shortcut with ADS icon (temporary)"
+            if ($script:UserPinnedStartMenu) { Write-Log "Kept Start Menu shortcut pointed to this script : $batFile" }
+            else                             { Write-Log "Auto-registered Start Menu shortcut with ADS icon (temporary)" }
         } catch { Write-Log "Failed to auto-register shortcut : $_" -Level Warning }
     }
 }
@@ -4003,7 +5095,9 @@ Enable-HitTestPassThrough $iconBox
 $titleLabel = gen $titleBar "Label" "$($script:AppName) v$($script:Version)" 34 0 145 $titleBarHeight "ForeColor=30 30 30" "Font=Arial, 10, Bold" "BackColor=240 240 240" "TextAlign=MiddleLeft"
 Enable-HitTestPassThrough $titleLabel
 
-$script:HasMDL2 = (New-Object System.Drawing.Text.InstalledFontCollection).Families | Where-Object { $_.Name -eq 'Segoe MDL2 Assets' }
+# Looked up by name : listing every installed font takes about 50 ms
+$script:HasMDL2 = $false
+try { $mdl2Family = New-Object System.Drawing.FontFamily('Segoe MDL2 Assets'); $script:HasMDL2 = $true; $mdl2Family.Dispose() } catch {}
 
 # Window buttons (Dock=Right : first added = rightmost)
 $btnMinimize = gen $titleBar "TitleBarButton" $(if($script:HasMDL2){[string][char]0xE921}else{[string][char]0x2015}) "Dock=Right" "Font=$(if($script:HasMDL2){'Segoe MDL2 Assets, 10'}else{'Arial, 10'})"
@@ -4058,12 +5152,15 @@ $btnReset.Add_Click({
         $radioEmbedIcon.Checked    = $true
         $script:CurrentIconIndex    = 0
         $script:CurrentExeIconCount = 0
-        $script:LastIconMenuPath    = ""
         $script:BuiltIconMenuPath   = $null
         $script:ArgsFromAutoSplit    = $false
         $script:PreviousTargetText   = ""
         $script:DeclinedSplitText    = $null
         $script:LastPinnedTaskbarFile = ""
+        if ($null -ne $script:ShellTargetIconCache) {
+            try { $script:ShellTargetIconCache.Dispose() } catch {}
+            $script:ShellTargetIconCache = $null
+        }
         # Reset special modes
         $script:IsShellTarget = $true
         Set-SpecialTargetMode 'Shell' $false
@@ -4212,6 +5309,10 @@ $btnAbout.Add_Click({
         gen $aboutForm "Panel" "" 20 160 340 2 "BorderStyle=FixedSingle" | Out-Null
         gen $aboutForm "Label" "Changelog :" 20 174 0 0 "Font=Arial, 10, Bold" "AutoSize=$true" "ForeColor=$fgCol" | Out-Null
         $aboutFormText = @"
+$([char]0x2022)  v1.3 : Update existing pins and icons
+          Taskbar pin fixes
+          Faster start, many fixes
+
 $([char]0x2022)  v1.2 : Fix pin already pinned
 
 $([char]0x2022)  v1.1 : Live DPI rescaling - UI polish
@@ -4288,6 +5389,10 @@ $([char]0x2022)  v1.0 : Initial release
             }
             $aboutForm.Invalidate($true)
         }.GetNewClosure())
+        $aboutForm.Add_Shown({
+            param($sender, $e)
+            Set-DarkScrollbars -Root $sender -Dark $isDk
+        })
         $aboutForm.ShowDialog($form) | Out-Null
     }
     catch {
@@ -4413,7 +5518,7 @@ $labelStandardInfo = gen $panelIconMethod "Label" "Shortcut points to an existin
 # Base64 textbox
 $base64Top = 176
 $base64Height = $dr.Y + $dr.Height - $base64Top - $script:GroupPadding
-$TextboxIcon_Base64 = gen $groupIcon "TextBox" $xLeft $base64Top $innerWidth $base64Height "Multiline=$true" "ScrollBars=Both" "WordWrap=$false" "Font=Consolas, 8" "Anchor=Top,Left,Bottom,Right" "Visible=$false"
+$TextboxIcon_Base64 = gen $groupIcon "TextBox" $xLeft $base64Top $innerWidth $base64Height "Multiline=$true" "ScrollBars=Both" "WordWrap=$false" "Font=Consolas, 8" "Anchor=Top,Left,Bottom,Right" "Visible=$false" "MaxLength=0"
 $TextboxIcon_Base64.Add_GotFocus({ $this.SelectAll() })
 $TextboxIcon_Base64.Add_Click({ $this.SelectAll() })
 
@@ -4446,16 +5551,18 @@ $labelExplorerWarn = gen $labelArgsLen "Label" "" "Dock=Fill" "Font=Segoe UI, 7.
 # Working directory
 $labelWorkDir = gen $groupShortcut "Label" "Working directory (optional) :" $xLeftR 196 $innerWidthR 18 "AutoSize=$true"
 $btnBrowseWorkDir = gen $groupShortcut "Button" "Browse..." ($xLeftR + $innerWidthR - 70) 217 70 20 "Anchor=Top,Right"
-$textWorkDir = gen $groupShortcut "TextBox" $xLeftR 217 ($innerWidthR - 80) 20 "Anchor=Top,Left,Right"
+# A shortcut keeps at most 259 characters of working directory and 260 of description
+$textWorkDir = gen $groupShortcut "TextBox" $xLeftR 217 ($innerWidthR - 80) 20 "Anchor=Top,Left,Right" "MaxLength=259"
 
 # Description
 $labelDescription = gen $groupShortcut "Label" "Comment / Description (optional) :" $xLeftR 250 $innerWidthR 18 "AutoSize=$true"
-$textDescription = gen $groupShortcut "TextBox" $xLeftR 272 $innerWidthR 20 "Anchor=Top,Left,Right"
+$textDescription = gen $groupShortcut "TextBox" $xLeftR 272 $innerWidthR 20 "Anchor=Top,Left,Right" "MaxLength=260"
 
 # AUMID
 $labelAumid = gen $groupShortcut "Label" "AUMID (optional) :" $xLeftR 305 150 18 "AutoSize=$true"
 $labelAumidHelp = gen $groupShortcut "Label" "Give a name to FORCE UNIQUE TASKBAR GROUP" ($xLeftR + 100) 307 ($innerWidthR - 100) 18 "Font=Segoe UI, 7.5" "TextAlign=TopRight" "Anchor=Top,Left,Right"
-$textAumid = gen $groupShortcut "TextBox" $xLeftR 327 $innerWidthR 20 "Anchor=Top,Left,Right" "MaxLength=128"
+$textAumid = gen $groupShortcut "HintTextBox" $xLeftR 327 $innerWidthR 20 "Anchor=Top,Left,Right" "MaxLength=128"
+$textAumid.Hint = "Letters, digits, . - _ ! - 128 chars max. e.g. 'MyApp.MyCompany.1'"
 
 # Shortcut location (.lnk)
 $labelLnkPath = gen $groupShortcut "Label" "Shortcut location (.lnk) :" $xLeftR 360 $innerWidthR 18 "Anchor=Top,Left,Right"
@@ -4488,6 +5595,7 @@ function Set-Theme {
             Fore        = [System.Drawing.Color]::White
             ForeDim     = [System.Drawing.Color]::FromArgb(160,160,160)
             ControlBack = [System.Drawing.Color]::FromArgb(55,55,55)
+            HintFore    = [System.Drawing.Color]::FromArgb(125,125,125)
             Border      = [System.Drawing.Color]::FromArgb(80,80,80)
             GroupBoxBorder = [System.Drawing.Color]::FromArgb(50,90,120)
             BtnBack     = [System.Drawing.Color]::FromArgb(60,60,60)
@@ -4505,6 +5613,7 @@ function Set-Theme {
             Fore        = [System.Drawing.Color]::FromArgb(30,30,30)
             ForeDim     = [System.Drawing.Color]::FromArgb(100,100,100)
             ControlBack = [System.Drawing.Color]::White
+            HintFore    = [System.Drawing.Color]::FromArgb(150,150,150)
             Border      = [System.Drawing.Color]::FromArgb(200,200,200)
             GroupBoxBorder = [System.Drawing.SystemColors]::ControlDark
             BtnBack     = [System.Drawing.Color]::FromArgb(240,240,240)
@@ -4571,6 +5680,8 @@ function Set-Theme {
         $tb.ForeColor   = $theme.Fore
         $tb.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     }
+    # Hint lighter than the dim labels, still readable on the field
+    $textAumid.HintColor = $theme.HintFore
     # Radio buttons
     foreach ($rb in @($radioIcon_TargetDefault, $radioIcon_Base64, $radioIcon_AnyFile, $radioEmbedIcon, $radioStandardIcon)) { $rb.ForeColor = $theme.Fore }
     # Standard buttons
@@ -4740,7 +5851,7 @@ function Get-ControlPanelItems {
         foreach ($fp in $files) {
             $desc = ""
             try { $vi = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($fp); if ($vi -and $vi.FileDescription) { $desc = ([string]$vi.FileDescription).Trim() } } catch {}
-            [void]$result.Add([pscustomobject]@{ Path = $fp; Name = [IO.Path]::GetFileName($fp); Description = $desc; ImgIdx = -1 })
+            [void]$result.Add((New-Object PSObject -Property @{ Path = $fp; Name = [IO.Path]::GetFileName($fp); Description = $desc; ImgIdx = -1 }))
         }
     }
     return @($result | Sort-Object Name)
@@ -4818,8 +5929,12 @@ function Show-ControlPanelPicker {
     $script:CpItemFg = $fgCol
     $script:CpSelBg  = if ($isDk) { [System.Drawing.Color]::FromArgb(50,90,120) }  else { [System.Drawing.Color]::FromArgb(204,232,255) }
 
+    # The list and its icons are read at the first opening only (about 0.5 s), then reused
     $form.UseWaitCursor = $true; [System.Windows.Forms.Application]::DoEvents()
-    try { $script:CpItems = @(Get-ControlPanelItems) } finally { $form.UseWaitCursor = $false }
+    try {
+        if ($null -eq $script:CpItemsCache) { $script:CpItemsCache = @(Get-ControlPanelItems) }
+        $script:CpItems = $script:CpItemsCache
+    } finally { $form.UseWaitCursor = $false }
 
     $dlg = New-Object CustomForm
     $dlg.Text = "Control Panel  -  pick a .cpl / .msc"
@@ -4856,7 +5971,17 @@ function Show-ControlPanelPicker {
     $img.ColorDepth = [System.Windows.Forms.ColorDepth]::Depth32Bit
     $lv.SmallImageList = $img; $script:CpImg = $img
     foreach ($it in $script:CpItems) {
-        try { $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($it.Path); if ($null -ne $ico) { $img.Images.Add($ico.ToBitmap()); $it.ImgIdx = $img.Images.Count - 1; $ico.Dispose() } } catch {}
+        if (-not $script:CpIconCache.ContainsKey($it.Path)) {
+            $bitmap = $null
+            try { $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($it.Path); if ($null -ne $ico) { $bitmap = $ico.ToBitmap(); $ico.Dispose() } } catch {}
+            $script:CpIconCache[$it.Path] = $bitmap
+        }
+        $it.ImgIdx = -1
+        # A copy goes to the list, which is disposed with the dialog; the cached bitmap stays
+        if ($null -ne $script:CpIconCache[$it.Path]) {
+            $img.Images.Add((New-Object System.Drawing.Bitmap($script:CpIconCache[$it.Path])))
+            $it.ImgIdx = $img.Images.Count - 1
+        }
     }
 
     $btnClose = New-Object System.Windows.Forms.Button
@@ -5035,6 +6160,13 @@ $textTarget.Add_TextChanged({
     }
     $currentText = $textTarget.Text
     if ($currentText -ne $script:PreviousTargetText) { $script:DeclinedSplitText = $null }
+    # An AUMID filled in by a dropped app is that app's : it goes when the target changes,
+    # or another shortcut would take the app's pin
+    if ($null -ne $script:AutoAumid -and (Get-CleanInput $currentText) -ne $script:AutoAumidTarget) {
+        if ($textAumid.Text -eq $script:AutoAumid) { $textAumid.Text = '' }
+        $script:AutoAumid = $null
+        $script:AutoAumidTarget = $null
+    }
     $len = (Get-CleanInput $currentText).Length
     $labelTargetLen.Text = "$len / $($script:MaxTargetPath)"
     $labelTargetLen.ForeColor = if ($len -gt $script:MaxTargetPath) { [System.Drawing.Color]::Red } else {
@@ -5091,9 +6223,16 @@ $textTarget.Add_TextChanged({
         $labelAumid.ForeColor     = $aumidDimColor
         $labelAumidHelp.ForeColor = $aumidDimColor
     }
-    # Refresh icon preview when Target Default is selected (icon depends on target)
+    # Refresh icon preview when Target Default is selected (icon depends on target) :
+    # once the user pauses while typing, at once when the program sets the target
     if ($radioIcon_TargetDefault.Checked) {
-        Update-IconPreview
+        if ($textTarget.Focused) {
+            $script:TargetPreviewDebounceTimer.Stop()
+            $script:TargetPreviewDebounceTimer.Start()
+        }
+        else {
+            Update-IconPreview
+        }
     }
     $script:PreviousTargetText = $textTarget.Text
     Update-ArgsLength
@@ -5153,8 +6292,8 @@ $textAumid.Add_KeyPress({
     $c = $_.KeyChar
     # Allow control characters (backspace, delete, etc.)
     if ([char]::IsControl($c)) { return }
-    # Allow only letters, digits, dots, hyphens
-    if ($c -match '[a-zA-Z0-9.\-]') { return }
+    # Allow only letters, digits, dots, hyphens, and the "_" "!" of a Store app's AUMID
+    if ($c -match '[a-zA-Z0-9.\-_!]') { return }
     $_.Handled = $true
 })
 
@@ -5197,7 +6336,7 @@ $btnBrowseLnk.Add_Click({
 })
 
 # .lnk path changed : detect existing files and auto-fill
-$textLnkPath.Add_TextChanged({
+function Update-LnkPathState {
     $lnkPath = Get-CleanInput $textLnkPath.Text
     if ((-not (Test-StringEmpty $lnkPath)) -and [System.IO.File]::Exists($lnkPath)) {
         $lnkExt = [IO.Path]::GetExtension($lnkPath).ToLower()
@@ -5210,12 +6349,36 @@ $textLnkPath.Add_TextChanged({
     }
     Request-CreateButtonUpdate
     Update-NtfsWarning
+}
+# Checked once the user pauses while typing (a path on a disconnected network drive blocks
+# each check for seconds), at once when the program sets the location
+$script:LnkPathDebounceTimer = New-Object System.Windows.Forms.Timer
+$script:LnkPathDebounceTimer.Interval = 300
+$script:LnkPathDebounceTimer.Add_Tick({
+    $this.Stop()
+    Update-LnkPathState
+})
+$textLnkPath.Add_TextChanged({
+    if ($textLnkPath.Focused) {
+        Request-CreateButtonUpdate
+        $script:LnkPathDebounceTimer.Stop()
+        $script:LnkPathDebounceTimer.Start()
+    }
+    else {
+        $script:LnkPathDebounceTimer.Stop()
+        Update-LnkPathState
+    }
 })
 
 #region ── CREATE SHORTCUT LOGIC ─
 
 $btnCreate.Add_Click({
     try {
+        # A location typed just before the click is checked first, as when the user pauses
+        if ($script:LnkPathDebounceTimer.Enabled) {
+            $script:LnkPathDebounceTimer.Stop()
+            Update-LnkPathState
+        }
         $lnkPath = Get-CleanInput $textLnkPath.Text
         $useEmbed = $radioIcon_Base64.Checked -or ($radioIcon_AnyFile.Checked -and $radioEmbedIcon.Checked)
         if ($script:IsUrlTarget) {
@@ -5228,7 +6391,7 @@ $btnCreate.Add_Click({
         if ($useEmbed -and -not (Test-NtfsVolume $lnkPath)) {
             Write-Log "Shortcut creation blocked : destination not NTFS and embed mode selected" -Level Error
             [System.Windows.Forms.MessageBox]::Show(
-                "The destination is not on an NTFS volume.`nADS icon embedding requires NTFS.`n`nSwitch to 'Standard icon reference' or choose an NTFS destination.",
+                "The destination cannot hold NTFS alternate data streams (FAT, exFAT, some cloud folders).`nADS icon embedding requires them.`n`nSwitch to 'Standard path' or choose an NTFS or ReFS destination.",
                 "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
             return
         }
@@ -5240,8 +6403,9 @@ $btnCreate.Add_Click({
         $existingLnk = [IO.File]::Exists($lnkPath)
         $backupPath  = $null
         if ($existingLnk) {
-            $backupPath = $lnkPath + '.bak'
-            if ([IO.File]::Exists($backupPath)) { [IO.File]::Delete($backupPath) }
+            # A name no file has : the backup never replaces a file of the user
+            do { $backupPath = '{0}.{1}.bak' -f $lnkPath, [Guid]::NewGuid().ToString('N').Substring(0, 8) }
+            while ([IO.File]::Exists($backupPath) -or [IO.Directory]::Exists($backupPath))
             [IO.File]::Move($lnkPath, $backupPath)
         }
         $saveCommitted = $false
@@ -5251,16 +6415,11 @@ $btnCreate.Add_Click({
         $createTargetExt = ''
         try { $createTargetExt = [IO.Path]::GetExtension($createTargetPath).ToLower() } catch {}
         if ($createTargetExt -eq '.cpl' -and -not $script:IsShellTarget -and -not $script:IsUrlTarget) {
-            $resolvedCplPath = $createTargetPath
-            if (-not [IO.File]::Exists($resolvedCplPath)) {
-                $system32Candidate = [IO.Path]::Combine($env:SystemRoot, 'System32', [IO.Path]::GetFileName($createTargetPath))
-                if ([IO.File]::Exists($system32Candidate)) { $resolvedCplPath = $system32Candidate }
-            }
-            $cplItem = Resolve-CplControlPanelItem $resolvedCplPath
+            $cplItem = Resolve-CplControlPanelItem $createTargetPath
             if ($null -ne $cplItem) {
-                $userDesc = $textDescription.Text.Trim()
+                $userDesc = Get-ActiveDescription
                 if (Test-StringEmpty $userDesc) { $userDesc = $cplItem.Name }
-                $userAumid = Get-CleanInput $textAumid.Text
+                $userAumid = Get-ActiveAumid
                 if (Test-StringEmpty $userAumid) { $userAumid = $cplItem.Path }
                 $useEmbed = $radioIcon_Base64.Checked -or ($radioIcon_AnyFile.Checked -and $radioEmbedIcon.Checked)
                 $hasIcon = -not $radioIcon_TargetDefault.Checked
@@ -5355,7 +6514,11 @@ $btnCreate.Add_Click({
 })
 
 $btnPin.Add_Click({
-    $tempLnkCreated = $false
+    if ($script:PinButtonBusy -or $script:TaskbarPinBusy) {
+        return
+    }
+    $script:PinButtonBusy = $true
+    $pinTempDirectory = $null
     $lnkToPin = $null
     try {
         $btnPin.Enabled = $false
@@ -5371,15 +6534,19 @@ $btnPin.Add_Click({
         else {
             # Case 2 : build temp .lnk from current fields
             $targetPath = Get-CleanInput $textTarget.Text
-            if (Test-StringEmpty $targetPath) { return }
-            $displayName = if (-not (Test-StringEmpty $lnkPath)) { [IO.Path]::GetFileNameWithoutExtension($lnkPath) }
-                           else { [IO.Path]::GetFileNameWithoutExtension($targetPath) }
-            $lnkToPin = [IO.Path]::Combine($env:TEMP, "$displayName.lnk")
+            if (Test-StringEmpty $targetPath) {
+                return
+            }
+            $displayName = Get-PinShortcutName $lnkPath $targetPath (Get-ActiveDescription)
+            $pinTempDirectory = New-PinStagingDirectory
+            $lnkToPin = [IO.Path]::Combine($pinTempDirectory, "$displayName.lnk")
             if ($script:IsUrlTarget) {
                 # URL targets : create a .lnk that opens the URL via explorer.exe
-                $pinAumid = Get-CleanInput $textAumid.Text
-                $pinDesc  = $textDescription.Text.Trim()
-                if (Test-StringEmpty $pinDesc) { $pinDesc = $displayName }
+                $pinAumid = Get-ActiveAumid
+                $pinDesc  = Get-ActiveDescription
+                if (Test-StringEmpty $pinDesc) {
+                    $pinDesc = $displayName
+                }
                 $pinIcoBytes = Get-IcoBytesFromCurrentSource
                 if ($null -ne $pinIcoBytes -and $pinIcoBytes.Length -gt 0) {
                     [ShortcutHelper]::CreateWithEmbeddedIcon($lnkToPin, "explorer.exe", $targetPath, ([byte[]]$pinIcoBytes), $pinAumid, $pinDesc)
@@ -5395,20 +6562,17 @@ $btnPin.Add_Click({
                 $pinTargetExt = ''
                 try { $pinTargetExt = [IO.Path]::GetExtension($targetPath).ToLower() } catch {}
                 if ($pinTargetExt -eq '.cpl') {
-                    # Resolve relative .cpl paths (e.g. "main.cpl" -> "C:\Windows\System32\main.cpl")
-                    $resolvedCplPath = $targetPath
-                    if (-not [IO.File]::Exists($resolvedCplPath)) {
-                        $system32Candidate = [IO.Path]::Combine($env:SystemRoot, 'System32', [IO.Path]::GetFileName($targetPath))
-                        if ([IO.File]::Exists($system32Candidate)) { $resolvedCplPath = $system32Candidate }
-                    }
-                    $cplItem = Resolve-CplControlPanelItem $resolvedCplPath
+                    $cplItem = Resolve-CplControlPanelItem $targetPath
                     if ($null -ne $cplItem) {
-                        $safeCplName = $cplItem.Name -replace '[<>:"/\\|?*]', '_'
-                        $lnkToPin = [IO.Path]::Combine($env:TEMP, "$safeCplName.lnk")
-                        $pinAumid = Get-CleanInput $textAumid.Text
-                        if (Test-StringEmpty $pinAumid) { $pinAumid = $cplItem.Path }
-                        $pinDesc  = $textDescription.Text.Trim()
-                        if (Test-StringEmpty $pinDesc) { $pinDesc = $cplItem.Name }
+                        # $displayName : the shortcut location's name, else the Control Panel's name
+                        $pinAumid = Get-ActiveAumid
+                        if (Test-StringEmpty $pinAumid) {
+                            $pinAumid = $cplItem.Path
+                        }
+                        $pinDesc  = Get-ActiveDescription
+                        if (Test-StringEmpty $pinDesc) {
+                            $pinDesc = $cplItem.Name
+                        }
                         if (-not $radioIcon_TargetDefault.Checked) {
                             $pinIcoBytes = Get-IcoBytesFromCurrentSource
                             if ($null -ne $pinIcoBytes -and $pinIcoBytes.Length -gt 0) {
@@ -5444,7 +6608,6 @@ $btnPin.Add_Click({
                     Write-Log "Pin to Taskbar : built temp .lnk : $lnkToPin"
                 }
             }
-            $tempLnkCreated = $true
         }
         $success = Invoke-TaskbarPin $lnkToPin
         if ($success) {
@@ -5463,13 +6626,14 @@ $btnPin.Add_Click({
             "Pin to Taskbar", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     }
     finally {
-        if ($tempLnkCreated -and $lnkToPin -and [IO.File]::Exists($lnkToPin)) {
-            try { [IO.File]::Delete($lnkToPin) } catch {}
+        $script:PinButtonBusy = $false
+        try {
+            Remove-PinStagingDirectory $pinTempDirectory
+        } catch {
+            Write-Log "Pin staging cleanup failed : $($_.Exception.Message)" -Level Warning
         }
         $form.UseWaitCursor = $false
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
-        # Let the state helper set the final button state : it disables the button when
-        # the item ended up pinned, and re-enables it otherwise (e.g. on a failed pin).
         Update-PinButtonState
     }
 })
@@ -5569,7 +6733,10 @@ $form.add_OnWindowMessage({
             try {
                 $regObj = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" -Name "AppsUseLightTheme" -ErrorAction SilentlyContinue
                 $isDarkNow = ($null -ne $regObj -and $regObj.AppsUseLightTheme -eq 0)
-                if ($isDarkNow -ne $script:IsDarkMode) {
+                # Windows broadcasts this message for many settings : only a change of the
+                # system theme itself overrides the user's own Dark mode choice
+                if ($isDarkNow -ne $script:SystemDarkMode) {
+                    $script:SystemDarkMode = $isDarkNow
                     $chkDarkMode.Checked = $isDarkNow
                     Write-Log "System theme change detected : $(if ($isDarkNow) {'Dark'} else {'Light'})"
                 }
@@ -5652,7 +6819,10 @@ $form.Add_Load({
         if ($null -ne $regObj -and $regObj.AppsUseLightTheme -eq 0) { $isDarkSystem = $true }
     } catch { }
     Write-Log "System theme detected : $(if ($isDarkSystem) {'Dark'} else {'Light'})"
-    $chkDarkMode.Checked = $isDarkSystem
+    $script:SystemDarkMode = $isDarkSystem
+    # The theme is applied in both cases : the box already unchecked raises no CheckedChanged
+    if ($chkDarkMode.Checked -eq $isDarkSystem) { Set-Theme $isDarkSystem }
+    else                                         { $chkDarkMode.Checked = $isDarkSystem }
 })
 
 $form.Add_Shown({
@@ -5671,8 +6841,6 @@ $form.Add_Shown({
     }
     Set-DarkScrollbars -Root $form -Dark $script:IsDarkMode
     [DarkMode]::ApplyWindowFrame($form.Handle, $script:IsDarkMode)
-    # AUMID placeholder (cue banner)
-    [NativeMethods]::SendMessageW($textAumid.Handle, 0x1501, 0, "Letters, digits, dots, hyphens - 128 chars max. e.g. 'MyApp.MyCompany.1'") | Out-Null
     Update-ArgsLength
     Update-CreateButtonState
     $form.BringToFront()
@@ -5697,25 +6865,28 @@ function Invoke-ApplicationCleanup {
     # Stop debounce timer
     try { $script:CreateBtnDebounceTimer.Stop(); $script:CreateBtnDebounceTimer.Dispose() } catch {}
     try { $script:Base64DebounceTimer.Stop(); $script:Base64DebounceTimer.Dispose() } catch {}
+    try { $script:TargetPreviewDebounceTimer.Stop(); $script:TargetPreviewDebounceTimer.Dispose() } catch {}
+    try { $script:LnkPathDebounceTimer.Stop(); $script:LnkPathDebounceTimer.Dispose() } catch {}
     try { Reset-CreateButtonFlash } catch {}
     # Dispose GDI resources
     foreach ($pen in @($script:FormBorderPenLight, $script:FormBorderPenDark, $script:DropZonePen, $script:GroupBoxBorderPen)) {
         if ($null -ne $pen) { try { $pen.Dispose() } catch {} }
     }
     if ($null -ne $script:CurrentPreviewBitmap) { try { $script:CurrentPreviewBitmap.Dispose() } catch {} }
-        if ($null -ne $script:ShellTargetIconCache) { try { $script:ShellTargetIconCache.Dispose() } catch {} }
+    if ($null -ne $script:ShellTargetIconCache) { try { $script:ShellTargetIconCache.Dispose() } catch {} }
     # Dispose icon index menu and its images
     foreach ($item in $script:IconIndexMenu.Items) {
         if ($item.Image) { try { $item.Image.Dispose() } catch {} }
     }
     try { $script:IconIndexMenu.Dispose() } catch {}
+    foreach ($bitmap in @($script:CpIconCache.Values)) { if ($null -ne $bitmap) { try { $bitmap.Dispose() } catch {} } }
     # Dispose icon resources
     if ($null -ne $iconImage)      { try { $iconImage.Dispose() }      catch {} }
     if ($null -ne $taskIcon)       { try { $taskIcon.Dispose() }       catch {} }
     if ($null -ne $taskIconStream) { try { $taskIconStream.Dispose() } catch {} }
     # Start Menu shortcut lifecycle
     $taskbarLnk = [IO.Path]::Combine($script:TaskbarPinDir, $script:LnkName)
-    $taskbarPinExists = [IO.File]::Exists($taskbarLnk)
+    $taskbarPinExists = (Test-OwnTaskbarPin) -or (Test-CurrentTaskbarPin $taskbarLnk -PreserveOnReadFailure)
     if ($taskbarPinExists) { Write-Log "Taskbar pin exists, preserving Start Menu shortcut as icon source" }
     $startMenuLnk = [IO.Path]::Combine($script:StartMenuDir, $script:LnkName)
     if ([IO.File]::Exists($startMenuLnk)) {

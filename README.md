@@ -1,6 +1,6 @@
 # Shortcuterie
 
-A Windows shortcut (.lnk) creation tool that can embeds custom icons directly inside shortcut files using **NTFS Alternate Data Streams**.
+A Windows shortcut (.lnk) creation tool that can embed custom icons directly inside shortcut files using **NTFS Alternate Data Streams**.
 > **How does it work?** See the [Documentation](Documentation.md)
 
 ![Windows 7](https://img.shields.io/badge/Windows-7%2B-blue?logo=windows)
@@ -22,7 +22,7 @@ A Windows shortcut (.lnk) creation tool that can embeds custom icons directly in
 
 - Windows 7+
 - PowerShell 2.0+
-- NTFS filesystem (for injected icons)
+- NTFS or ReFS filesystem (for injected icons)
 
 ## Usage
 
@@ -40,9 +40,9 @@ The entire window is a drop target with zone-based routing:
 | Drop Zone | Behavior |
 |-----------|----------|
 | **Left panel** (Icon Source) | Choose an icon from any file |
-| **Target field** | Sets the target path. Dropping a .lnk extracts its target, args, working dir, and description |
+| **Target field** | Sets the target path. Dropping a .lnk extracts its target, args, working dir, description and AUMID; a .url gives its URL |
 | **Working Directory field** | Sets the working directory from the dropped file/folder location |
-| **Shortcut Location field** | Sets the save path. Dropping an existing .lnk imports all its fields for editing |
+| **Shortcut Location field** | Sets the save path. A dropped folder receives the shortcut, named after the target. Dropping an existing .lnk or .url imports all its fields for editing |
 
 ### Icon Embedding Modes
 
@@ -54,11 +54,11 @@ The entire window is a drop target with zone-based routing:
 
 ### Taskbar Pinning
 
-Click **Pin to Taskbar** to add the shortcut into the taskbar. This works for standard executables and UWP apps.
+Click **Pin to Taskbar** to add the shortcut into the taskbar. This works for standard executables and UWP apps. When the shortcut is already pinned, the button reads **Update Pin** and updates the pinned item in place, icon included.
 
 ## Limitations
 
-- ADS icon embedding requires NTFS. Icons are silently broken when copying to FAT32, exFAT, or most cloud-synced folders.
+- ADS icon embedding requires NTFS (or ReFS). Icons are silently broken when copying to FAT32, exFAT, or most cloud-synced folders.
 - Normal copy/cut-paste of a shortcut will preserve injected icon. But if a tool handles the operation, the icon can break depending on how this tool works.
 
 ## License
