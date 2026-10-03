@@ -337,13 +337,14 @@ Refer to this project : https://github.com/Freenitial/Pin-Taskbar
 |---------|----------|
 | **Non-NTFS drive (FAT, Cloud...)** | ADS exists on NTFS and ReFS only. On FAT, exFAT and some cloud folders the icon is silently stripped when copying. Shortcuterie probes the destination folder with a test write before creation and warns the user. |
 | **Copy to ZIP/archive** | ADS is stripped by all archive formats. The .lnk becomes icon-less. |
-| **IPersistFile::Save destroys ADS** | Every COM save rewrites the default stream, which erases any existing ADS. Shortcuterie always writes the ADS *after* saving the .lnk. |
+| **IPersistFile::Save destroys ADS** | Every COM save rewrites the default stream, which erases any existing ADS. Shortcuterie always writes the ADS *after* saving the .lnk. When only a property of an existing shortcut changes, the shortcut is saved to another file whose content is then written over it in place, which keeps its streams. |
 | **Icon cache** | Explorer caches icons by location. Each icon is stored under a name derived from its content, so an updated icon has a new location and shows at once. |
 | **Explorer Properties dialog** | Shows the self-referencing `file.lnk:icon-XXXXXXXX.ico` path in the icon field. Functional but looks unusual to users. |
 | **Field lengths** | A shortcut keeps at most 259 characters of target, working directory and icon location, and 260 of comment. Shortcuterie enforces these limits; an embedded icon's location (shortcut path + `:icon-XXXXXXXX.ico`) caps the shortcut path at 241 characters. |
 | **Target + Args > 259 chars** | Explorer's property sheet truncates the combined string, making it uneditable via Properties. The shortcut itself works fine - `CreateProcess` supports 32,767 chars. |
 | **Negative icon resource IDs** | Some icon references use resource IDs (negative integers) instead of sequential indices. They are read from the PE resource table by their ID, with every native size. |
-| **URL shortcuts (.url)** | Written and read through Windows' Internet Shortcut object, which keeps characters outside the ANSI code page in the file's Unicode section. A .url references its icon file, so only an .ico, .exe or .dll can be its icon. |
+| **URL shortcuts (.url)** | Written and read through Windows' Internet Shortcut object, which keeps characters outside the ANSI code page in the file's Unicode section. The rest of the file is read in the system's ANSI code page. A .url references its icon file, so only an .ico, .exe or .dll can be its icon. |
+| **PowerShell versions** | Runs on Windows PowerShell 2.0 to 5.1 and on PowerShell 7. The launcher uses Windows PowerShell, else PowerShell 7. On PowerShell 7 (.NET), the C# code is compiled against .NET's reference assemblies and the Windows Forms assemblies. |
 | **Elevated processes (admin)** | UIPI blocks OLE drag-drop from non-elevated Explorer. Shortcuterie falls back to `WM_DROPFILES` via `ChangeWindowMessageFilterEx`. |
 
 ---

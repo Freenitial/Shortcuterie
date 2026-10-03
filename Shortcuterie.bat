@@ -15,12 +15,18 @@
     :: The script's path reaches PowerShell through the environment : as a quoted literal,
     :: an apostrophe in a folder name ("Outils d'admin") would end the string.
     set "SHORTCUTERIE_BAT=%~f0"
-    powershell -NoLogo -NoProfile -STA -Window Hidden -Command ^
+    :: Windows PowerShell, else PowerShell 7 where it is the only one
+    set "ps=powershell"
+    if not exist "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" set "ps=pwsh"
+    %ps% -NoLogo -NoProfile -STA -WindowStyle Hidden -Command ^
         ^
         %= Create loading popup =% ^
         "$M=[Runtime.InteropServices.Marshal];" ^
-        "$d=[AppDomain]::CurrentDomain.DefineDynamicAssembly(" ^
-        "(New-Object Reflection.AssemblyName('W')),'Run').DefineDynamicModule('W');" ^
+        %= Dynamic assembly - AppDomain on .NET Framework, AssemblyBuilder on .NET =% ^
+        "$n=New-Object Reflection.AssemblyName('W');$b=$null;" ^
+        "try{$b=[AppDomain]::CurrentDomain.DefineDynamicAssembly($n,'Run')}" ^
+        "catch{$b=[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($n,'Run')};" ^
+        "$d=$b.DefineDynamicModule('W');" ^
         "$t=$d.DefineType('A','Public,Class');" ^
         "$z=$t.DefinePInvokeMethod('CreateWindowExW','user32.dll'," ^
         "'Public,Static,PinvokeImpl','Standard',([IntPtr])," ^
@@ -70,7 +76,7 @@
 #region ── VERSION & PATHS ─
 
 $script:AppName       = "Shortcuterie"
-$script:Version       = [version]"1.3"
+$script:Version       = [version]"1.4"
 
 # ---- Remaining functions for Invoke-LoadingPump + updates ----
 $t=$d.DefineType('E','Public,Class')
@@ -99,10 +105,41 @@ $script:StartMenuDir  = [Environment]::GetFolderPath("Programs")
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# The C# references. On PowerShell 6 and later (.NET), naming references replaces the default
+# ones, and the forms and drawing types live in other assemblies : the framework's reference
+# assemblies ($PSHOME\ref, else the platform's own), then the forms and drawing assemblies with
+# those they depend on.
+$script:CSharpReferences = @('System.Drawing.dll', 'System.Windows.Forms.dll')
+if ($PSVersionTable.PSVersion.Major -ge 6 -and -not ('TaskbarPinHelper' -as [type])) {
+    $references = @{}
+    $referenceFolder = [IO.Path]::Combine($PSHOME, 'ref')
+    if ([IO.Directory]::Exists($referenceFolder)) {
+        foreach ($file in [IO.Directory]::GetFiles($referenceFolder, '*.dll')) { $references[[IO.Path]::GetFileNameWithoutExtension($file)] = $file }
+        $pending = New-Object System.Collections.Queue
+        $pending.Enqueue([System.Windows.Forms.Form].Assembly)
+        $pending.Enqueue([System.Drawing.Bitmap].Assembly)
+        while ($pending.Count -gt 0) {
+            $assembly = $pending.Dequeue()
+            $name = $assembly.GetName().Name
+            if ($references.ContainsKey($name) -or $name -eq 'System.Private.CoreLib') { continue }
+            $references[$name] = $assembly.Location
+            foreach ($dependency in $assembly.GetReferencedAssemblies()) {
+                if (-not $references.ContainsKey($dependency.Name)) { try { $pending.Enqueue([Reflection.Assembly]::Load($dependency)) } catch {} }
+            }
+        }
+    }
+    else {
+        foreach ($file in ([string][AppContext]::GetData('TRUSTED_PLATFORM_ASSEMBLIES')).Split([IO.Path]::PathSeparator)) {
+            if ($file) { $references[[IO.Path]::GetFileNameWithoutExtension($file)] = $file }
+        }
+    }
+    $script:CSharpReferences = @($references.Values)
+}
+
 # Every C# type in one compilation : each Add-Type runs the compiler once (about 150 ms).
 # DPI awareness must be set before creating any window.
 if (-not ('TaskbarPinHelper' -as [type])) {
-    Add-Type -ReferencedAssemblies System.Drawing.dll, System.Windows.Forms.dll -TypeDefinition @'
+    Add-Type -ReferencedAssemblies $script:CSharpReferences -TypeDefinition @'
 using System;
 using System.Collections.Generic;
 using System.Drawing;
@@ -702,6 +739,31 @@ public static class ShortcutHelper
         }
         return null;
     }
+    // The link is saved to a temporary file, whose content then replaces the shortcut's in place :
+    // a save over the shortcut would drop its alternate data streams, an embedded icon among them.
+    public static void SetAppUserModelId(string lnkPath, string appId)
+    {
+        string savedPath = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N") + ".lnk");
+        try
+        {
+            IShellLink link = (IShellLink)new ShellLink();
+            try
+            {
+                // STGM_READWRITE : the property store of a link loaded read-only refuses the change
+                ((IPersistFile)link).Load(lnkPath, 2);
+                ApplyAppId(link, appId);
+                ((IPersistFile)link).Save(savedPath, false);
+            }
+            finally { Marshal.ReleaseComObject(link); }
+            byte[] content = System.IO.File.ReadAllBytes(savedPath);
+            using (System.IO.FileStream stream = new System.IO.FileStream(lnkPath, System.IO.FileMode.Open, System.IO.FileAccess.Write, System.IO.FileShare.Read))
+            {
+                stream.Write(content, 0, content.Length);
+                stream.SetLength(content.Length);
+            }
+        }
+        finally { try { System.IO.File.Delete(savedPath); } catch { } }
+    }
     // ── PIDL resolution (shell CLSID shortcuts) ──
     [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
     private static extern int SHGetNameFromIDList(IntPtr pidl, uint sigdnName, out IntPtr ppszName);
@@ -798,6 +860,15 @@ public static class ShortcutHelper
         string url;
         ((IUniformResourceLocatorW)shortcut).GetURL(out url);
         return url == null ? "" : url;
+    }
+    // The system's ANSI code page, in which Windows writes a .url file : Encoding.Default is
+    // UTF-8 on .NET (PowerShell 6 and later). Encoding.Default when the code page is unavailable.
+    [DllImport("kernel32.dll")]
+    private static extern uint GetACP();
+    public static System.Text.Encoding AnsiEncoding()
+    {
+        try { return System.Text.Encoding.GetEncoding((int)GetACP()); }
+        catch { return System.Text.Encoding.Default; }
     }
 }
 
@@ -2540,6 +2611,7 @@ $script:LastPinnedConfigKey   = ""     # target|lnk snapshot from the last taskb
 $script:LnkHintShown          = $null  # warning under Shortcut location set by Update-CreateButtonState
 $script:AutoAumid             = $null  # AUMID filled in by a dropped app, cleared with it when the target changes
 $script:AutoAumidTarget       = $null
+$script:CplIconTarget         = $null  # .cpl target whose icon the icon source was set to
 
 # Shortcut limits (MS-SHLLINK spec)
 $script:MaxTargetPath        = 259      # MAX_PATH less its terminating null : a longer target fails to save
@@ -2924,8 +2996,15 @@ $script:TargetPreviewDebounceTimer = New-Object System.Windows.Forms.Timer
 $script:TargetPreviewDebounceTimer.Interval = 300
 $script:TargetPreviewDebounceTimer.Add_Tick({
     $this.Stop()
-    if ($script:SuppressPreviewUpdate -or -not $radioIcon_TargetDefault.Checked) { return }
-    Update-IconPreview
+    if ($script:SuppressPreviewUpdate) { return }
+    # A .cpl typed or pasted brings its icon, as a dropped one does
+    $typedTarget = Get-CleanInput $textTarget.Text
+    if ($typedTarget -ne $script:CplIconTarget -and $typedTarget.EndsWith('.cpl', [StringComparison]::OrdinalIgnoreCase) -and
+        -not $script:IsShellTarget -and -not $script:IsUrlTarget -and [IO.File]::Exists((Get-CplFullPath $typedTarget))) {
+        Set-CplIconSource $typedTarget
+        return
+    }
+    if ($radioIcon_TargetDefault.Checked) { Update-IconPreview }
 })
 $script:CreateBtnFlashTimer = $null
 function Reset-CreateButtonFlash {
@@ -3353,6 +3432,32 @@ function New-ShortcutFromFields {
     return @{ IconMode = $iconMode; IcoBytes = $icoBytes; IconFilePath = $iconFilePath; IconIndex = $iconIndex }
 }
 
+# ── A shortcut to the Control Panel item of a .cpl, described and identified by that item ──
+# unless the Description or AUMID field says otherwise; the icon as the icon source sets it
+function New-CplItemShortcut {
+    param([string]$OutputPath, $CplItem)
+    $description = Get-ActiveDescription
+    if (Test-StringEmpty $description) { $description = $CplItem.Name }
+    $aumid = Get-ActiveAumid
+    if (Test-StringEmpty $aumid) { $aumid = $CplItem.Path }
+    $useEmbed = $radioIcon_Base64.Checked -or ($radioIcon_AnyFile.Checked -and $radioEmbedIcon.Checked)
+    $hasIcon  = -not $radioIcon_TargetDefault.Checked -and -not (Test-IconSourceEmpty)
+    if ($hasIcon -and $useEmbed) {
+        $icoBytes = Get-IcoBytesFromCurrentSource
+        if ($null -eq $icoBytes -or $icoBytes.Length -eq 0) {
+            throw 'The icon could not be built from the icon source.'
+        }
+        [ShortcutHelper]::CreateShellWithEmbeddedIcon($OutputPath, $CplItem.Path, ([byte[]]$icoBytes), $aumid, $description)
+        Write-AdsIcon -FilePath $OutputPath -IcoBytes ([byte[]]$icoBytes)
+    }
+    elseif ($hasIcon) {
+        [ShortcutHelper]::CreateShellWithStandardIcon($OutputPath, $CplItem.Path, (Get-CleanInput $iconPathTextbox.Text), $script:CurrentIconIndex, $aumid, $description)
+    }
+    else {
+        [ShortcutHelper]::CreateShellWithStandardIcon($OutputPath, $CplItem.Path, "", 0, $aumid, $description)
+    }
+}
+
 # ── Point a shortcut whose icon lives in an alternate data stream to that icon in a stream of HostPath ──
 function Set-OwnAdsIcon {
     param([string]$ShortcutPath, [string]$HostPath)
@@ -3531,6 +3636,61 @@ function Restore-ShortcuteriePinFile {
     }
 }
 
+# True when Windows' application resolver answers (it gives a shortcut to explorer.exe its
+# AppID) : an empty AppID then means Windows has none for the shortcut, not that it was not asked
+$script:AppResolverAnswers = $null
+function Test-AppResolver {
+    param([string]$Directory)
+    if ($null -eq $script:AppResolverAnswers) {
+        $probe = [IO.Path]::Combine($Directory, 'resolver-probe.lnk')
+        try {
+            [ShortcutHelper]::CreateWithStandardIcon($probe, [IO.Path]::Combine($env:SystemRoot, 'explorer.exe'), '', '', 0, '', '')
+            $script:AppResolverAnswers = -not (Test-StringEmpty ([TaskbarPinHelper]::GetShortcutAppId($probe)))
+        } catch {
+            $script:AppResolverAnswers = $false
+        } finally {
+            try { [IO.File]::Delete($probe) } catch {}
+        }
+        if (-not $script:AppResolverAnswers) { Write-Log "Windows' application resolver does not answer : no AppID is written in pinned shortcuts" -Level Warning }
+    }
+    return $script:AppResolverAnswers
+}
+
+# The AppID a shortcut is pinned under : the one Windows gives it, else (FromWindows false) its
+# AUMID, its target with its arguments (two shortcuts to control.exe are two items), its shell
+# item or its name; a .cpl's Control Panel item when it has one.
+function Get-PinAppId {
+    param([string]$LnkPath)
+    $appId = [TaskbarPinHelper]::GetShortcutAppId($LnkPath)
+    if (-not (Test-StringEmpty $appId)) {
+        return @{ AppId = $appId; FromWindows = $true }
+    }
+    foreach ($resolver in @(
+        { [ShortcutHelper]::GetAppUserModelId($LnkPath) },
+        {
+            $target = [ShortcutHelper]::GetTargetPath($LnkPath)
+            $arguments = [ShortcutHelper]::GetArguments($LnkPath)
+            if (-not (Test-StringEmpty $target) -and -not (Test-StringEmpty $arguments)) { "$target $arguments" } else { $target }
+        },
+        { [ShortcutHelper]::GetParsedDisplayName($LnkPath) },
+        { [IO.Path]::GetFileNameWithoutExtension($LnkPath) }
+    )) {
+        try {
+            $appId = & $resolver
+        } catch {}
+        if (-not (Test-StringEmpty $appId)) {
+            break
+        }
+    }
+    if (-not (Test-StringEmpty $appId) -and $appId.EndsWith('.cpl', [StringComparison]::OrdinalIgnoreCase)) {
+        $cplItem = Resolve-CplControlPanelItem $appId
+        if ($null -ne $cplItem) {
+            $appId = $cplItem.Path
+        }
+    }
+    return @{ AppId = $appId; FromWindows = $false }
+}
+
 # Pin or update a shortcut with a complete resolution cache.
 function Invoke-TaskbarPin {
     param([string]$LnkPath)
@@ -3576,29 +3736,8 @@ function Invoke-TaskbarPin {
             }
             $values = Get-ShortcuteriePinValues $key
             $favBlob = $values.Favorites
-            $appId = [TaskbarPinHelper]::GetShortcutAppId($LnkPath)
-            $appIdFromWindows = -not (Test-StringEmpty $appId)
-            if (-not $appIdFromWindows) {
-                foreach ($resolver in @(
-                    { [ShortcutHelper]::GetAppUserModelId($LnkPath) },
-                    { [ShortcutHelper]::GetTargetPath($LnkPath) },
-                    { [ShortcutHelper]::GetParsedDisplayName($LnkPath) },
-                    { [IO.Path]::GetFileNameWithoutExtension($LnkPath) }
-                )) {
-                    try {
-                        $appId = & $resolver
-                    } catch {}
-                    if (-not (Test-StringEmpty $appId)) {
-                        break
-                    }
-                }
-                if (-not (Test-StringEmpty $appId) -and $appId.EndsWith('.cpl', [StringComparison]::OrdinalIgnoreCase)) {
-                    $cplItem = Resolve-CplControlPanelItem $appId
-                    if ($null -ne $cplItem) {
-                        $appId = $cplItem.Path
-                    }
-                }
-            }
+            $pinAppId = Get-PinAppId $LnkPath
+            $appId = $pinAppId.AppId
             if (Test-StringEmpty $appId) {
                 throw 'The shortcut has no usable application identity.'
             }
@@ -3617,7 +3756,7 @@ function Invoke-TaskbarPin {
                 # gets ' (2)', ' (3)'..., as Windows does : it never writes over another file.
                 $destLnk = [IO.Path]::Combine($taskBarDir, [IO.Path]::GetFileName($LnkPath))
                 for ($nameSuffix = 2; [IO.File]::Exists($destLnk); $nameSuffix++) {
-                    $existingAppId = [TaskbarPinHelper]::GetShortcutAppId($destLnk)
+                    $existingAppId = (Get-PinAppId $destLnk).AppId
                     if (-not (Test-StringEmpty $existingAppId) -and [string]::Equals($existingAppId, $appId, [StringComparison]::OrdinalIgnoreCase)) {
                         break
                     }
@@ -3639,6 +3778,24 @@ function Invoke-TaskbarPin {
             $stageDirectory = New-PinStagingDirectory
             $stagedLnk = [IO.Path]::Combine($stageDirectory, [IO.Path]::GetFileName($destLnk))
             [IO.File]::Copy($LnkPath, $stagedLnk)
+            # Windows gives no AppID of its own to a shortcut to a .cpl, a script, a document or a
+            # folder, and lends the AppID a shortcut carries to every shortcut to the same item,
+            # the pinned one included. The pinned copy carries the AppID its pin is listed under,
+            # as its own : the taskbar, which recomputes it when the shortcut changes, would
+            # otherwise find none and drop the pin. A program whose AppID Windows computes keeps
+            # Windows' form.
+            if ((Test-StringEmpty ([ShortcutHelper]::GetAppUserModelId($stagedLnk))) -and (Test-AppResolver $stageDirectory)) {
+                $keepWindowsForm = $false
+                if ($pinAppId.FromWindows) {
+                    $stagedTargetExt = ''
+                    try { $stagedTargetExt = [IO.Path]::GetExtension([ShortcutHelper]::GetTargetPath($stagedLnk)) } catch {}
+                    $keepWindowsForm = ($stagedTargetExt -eq '.exe' -or $stagedTargetExt -eq '.com') -and
+                        -not ($destFileExists -and [string]::Equals([ShortcutHelper]::GetAppUserModelId($destLnk), $appId, [StringComparison]::OrdinalIgnoreCase))
+                }
+                if (-not $keepWindowsForm) {
+                    [ShortcutHelper]::SetAppUserModelId($stagedLnk, $appId)
+                }
+            }
             $icoBytes = Set-OwnAdsIcon $stagedLnk $destLnk
             # A shortcut keeps 259 characters of icon location : the pinned path plus ":icon-XXXXXXXX.ico"
             if ($null -ne $icoBytes -and $destLnk.Length + 18 -gt $script:MaxTargetPath) {
@@ -4125,7 +4282,8 @@ function Read-UrlShortcut {
     param([string]$Path)
     $sections = @{}
     $section = ''
-    foreach ($line in [IO.File]::ReadAllLines($Path, [System.Text.Encoding]::Default)) {
+    $ansiEncoding = [ShortcutHelper]::AnsiEncoding()
+    foreach ($line in [IO.File]::ReadAllLines($Path, $ansiEncoding)) {
         $trimmed = $line.Trim()
         if ($trimmed.StartsWith('[') -and $trimmed.EndsWith(']')) { $section = $trimmed; continue }
         $equals = $trimmed.IndexOf('=')
@@ -4140,7 +4298,7 @@ function Read-UrlShortcut {
         $value = [string]$ansi[$Name]
         if ($wide.ContainsKey($Name)) {
             $decoded = [System.Text.Encoding]::UTF7.GetString([System.Text.Encoding]::ASCII.GetBytes([string]$wide[$Name]))
-            if ([System.Text.Encoding]::Default.GetString([System.Text.Encoding]::Default.GetBytes($decoded)) -ceq $value) { $value = $decoded }
+            if ($ansiEncoding.GetString($ansiEncoding.GetBytes($decoded)) -ceq $value) { $value = $decoded }
         }
         return $value
     }
@@ -4647,6 +4805,26 @@ function Resolve-FileIcon {
     Write-Log "Could not resolve icon for : $FilePath" -Level Warning
 }
 
+# ── A .cpl target brings its own icon, embedded, whatever the icon source held ──
+# (Target Default would show the generic .cpl icon). Done once per target set.
+function Set-CplIconSource {
+    param([string]$CplPath)
+    $script:CplIconTarget = $CplPath
+    $cplFile = Get-CplFullPath $CplPath
+    if (-not [IO.File]::Exists($cplFile)) { return }
+    $script:SuppressPreviewUpdate = $true
+    try {
+        Resolve-FileIcon $cplFile
+        if ($radioIcon_AnyFile.Checked) {
+            $radioEmbedIcon.Checked = $true
+        }
+    }
+    finally {
+        $script:SuppressPreviewUpdate = $false
+        Update-IconPreview
+    }
+}
+
 # Full path of a .cpl : as given when it exists, else in System32 ("main.cpl")
 function Get-CplFullPath {
     param([string]$CplFilePath)
@@ -4850,8 +5028,11 @@ function Invoke-ZoneDrop {
                     }
                     finally { $script:SuppressTargetSplit = $false }
                     Write-Log "Target resolved from .lnk : $lnkTarget"
-                    # Auto-fill icon : switch to Target Default if icon source is currently empty
-                    if (Test-IconSourceEmpty) {
+                    # Auto-fill icon : a .cpl's own, else Target Default if icon source is currently empty
+                    if ($lnkTarget.EndsWith('.cpl', [StringComparison]::OrdinalIgnoreCase) -and [IO.File]::Exists($lnkTarget)) {
+                        Set-CplIconSource $lnkTarget
+                    }
+                    elseif (Test-IconSourceEmpty) {
                         $radioIcon_TargetDefault.Checked = $true
                     }
                 }
@@ -4887,15 +5068,7 @@ function Invoke-ZoneDrop {
                 $textTarget.Text = $FilePath
                 # Auto-fill icon
                 if ($ext -eq '.cpl') {
-                    # .cpl : Target Default would show a generic icon, resolve actual icon into Any File mode
-                    if ($radioIcon_TargetDefault.Checked -or (Test-IconSourceEmpty)) {
-                        $script:SuppressPreviewUpdate = $true
-                        try { Resolve-FileIcon $FilePath }
-                        finally {
-                            $script:SuppressPreviewUpdate = $false
-                            Update-IconPreview
-                        }
-                    }
+                    Set-CplIconSource $FilePath
                 }
                 elseif ($ext -eq '.msc') {
                     # .msc icons aren't usable via Any File (they render as invalid) :
@@ -5304,11 +5477,16 @@ $btnAbout.Add_Click({
         $linkGitHub.LinkColor        = if ($isDk) { [System.Drawing.Color]::FromArgb(100,180,255) } else { [System.Drawing.Color]::FromArgb(0,102,204) }
         $linkGitHub.ActiveLinkColor  = if ($isDk) { [System.Drawing.Color]::FromArgb(140,200,255) } else { [System.Drawing.Color]::FromArgb(0,80,180) }
         $linkGitHub.VisitedLinkColor = $linkGitHub.LinkColor
-        $linkGitHub.Add_LinkClicked({ [System.Diagnostics.Process]::Start("https://github.com/Freenitial") })
+        $linkGitHub.Add_LinkClicked({ Start-Process "https://github.com/Freenitial" })
         gen $aboutForm "Label" "Embeds icons directly into .lnk files via NTFS ADS." 20 131 0 0 "Font=Arial, 9" "AutoSize=$true" "ForeColor=$subFg" | Out-Null
         gen $aboutForm "Panel" "" 20 160 340 2 "BorderStyle=FixedSingle" | Out-Null
         gen $aboutForm "Label" "Changelog :" 20 174 0 0 "Font=Arial, 10, Bold" "AutoSize=$true" "ForeColor=$fgCol" | Out-Null
         $aboutFormText = @"
+$([char]0x2022)  v1.4 : Pins of .cpl, scripts, documents and
+          folders kept when updated
+          .cpl targets bring their own icon
+          PowerShell 7 support
+
 $([char]0x2022)  v1.3 : Update existing pins and icons
           Taskbar pin fixes
           Faster start, many fixes
@@ -6122,15 +6300,7 @@ $btnBrowseTarget.Add_Click({
         # Auto-fill icon
         $selectedExt = [IO.Path]::GetExtension($ofd.FileName).ToLower()
         if ($selectedExt -eq '.cpl') {
-            # .cpl : Target Default would show a generic icon, resolve actual icon into Any File mode
-            if ($radioIcon_TargetDefault.Checked -or (Test-IconSourceEmpty)) {
-                $script:SuppressPreviewUpdate = $true
-                try { Resolve-FileIcon $ofd.FileName }
-                finally {
-                    $script:SuppressPreviewUpdate = $false
-                    Update-IconPreview
-                }
-            }
+            Set-CplIconSource $ofd.FileName
         }
         elseif ($selectedExt -eq '.msc') {
             $radioIcon_TargetDefault.Checked = $true
@@ -6223,16 +6393,19 @@ $textTarget.Add_TextChanged({
         $labelAumid.ForeColor     = $aumidDimColor
         $labelAumidHelp.ForeColor = $aumidDimColor
     }
-    # Refresh icon preview when Target Default is selected (icon depends on target) :
-    # once the user pauses while typing, at once when the program sets the target
-    if ($radioIcon_TargetDefault.Checked) {
-        if ($textTarget.Focused) {
-            $script:TargetPreviewDebounceTimer.Stop()
-            $script:TargetPreviewDebounceTimer.Start()
-        }
-        else {
-            Update-IconPreview
-        }
+    # A .cpl typed again after another target brings its icon again
+    if ($null -ne $script:CplIconTarget -and (Get-CleanInput $currentText) -ne $script:CplIconTarget) {
+        $script:CplIconTarget = $null
+    }
+    # Refresh icon preview when Target Default is selected (icon depends on target), and take
+    # the icon of a .cpl the user types : once the user pauses while typing, at once when the
+    # program sets the target (an imported shortcut keeps its own icon)
+    if ($textTarget.Focused -and -not $script:SuppressTargetSplit) {
+        $script:TargetPreviewDebounceTimer.Stop()
+        $script:TargetPreviewDebounceTimer.Start()
+    }
+    elseif ($radioIcon_TargetDefault.Checked) {
+        Update-IconPreview
     }
     $script:PreviousTargetText = $textTarget.Text
     Update-ArgsLength
@@ -6417,37 +6590,14 @@ $btnCreate.Add_Click({
         if ($createTargetExt -eq '.cpl' -and -not $script:IsShellTarget -and -not $script:IsUrlTarget) {
             $cplItem = Resolve-CplControlPanelItem $createTargetPath
             if ($null -ne $cplItem) {
-                $userDesc = Get-ActiveDescription
-                if (Test-StringEmpty $userDesc) { $userDesc = $cplItem.Name }
-                $userAumid = Get-ActiveAumid
-                if (Test-StringEmpty $userAumid) { $userAumid = $cplItem.Path }
-                $useEmbed = $radioIcon_Base64.Checked -or ($radioIcon_AnyFile.Checked -and $radioEmbedIcon.Checked)
-                $hasIcon = -not $radioIcon_TargetDefault.Checked
-                if ($hasIcon -and $useEmbed) {
-                    $icoBytes = Get-IcoBytesFromCurrentSource
-                    if ($null -ne $icoBytes -and $icoBytes.Length -gt 0) {
-                        [ShortcutHelper]::CreateShellWithEmbeddedIcon($lnkPath, $cplItem.Path, ([byte[]]$icoBytes), $userAumid, $userDesc)
-                        Write-AdsIcon -FilePath $lnkPath -IcoBytes ([byte[]]$icoBytes)
-                    }
-                    else {
-                        [ShortcutHelper]::CreateShellWithStandardIcon($lnkPath, $cplItem.Path, "", 0, $userAumid, $userDesc)
-                    }
-                }
-                elseif ($hasIcon) {
-                    $iconFilePath = Get-CleanInput $iconPathTextbox.Text
-                    $iconIndex = $script:CurrentIconIndex
-                    [ShortcutHelper]::CreateShellWithStandardIcon($lnkPath, $cplItem.Path, $iconFilePath, $iconIndex, $userAumid, $userDesc)
-                }
-                else {
-                    [ShortcutHelper]::CreateShellWithStandardIcon($lnkPath, $cplItem.Path, "", 0, $userAumid, $userDesc)
-                }
+                New-CplItemShortcut $lnkPath $cplItem
                 $saveCommitted = $true
                 $action = if ($existingLnk) { "updated" } else { "created" }
                 Write-Log "CPL shortcut $action via PIDL : $lnkPath -> $($cplItem.Path)"
                 Invoke-CreateButtonFlash ([char]0x2714 + " " + ($action.Substring(0,1).ToUpper() + $action.Substring(1)))
                 return
             }
-            Write-Log "CPL namespace resolution failed for '$resolvedCplPath', falling back to standard shortcut" -Level Warning
+            Write-Log "CPL namespace resolution failed for '$createTargetPath', falling back to standard shortcut" -Level Warning
         }
         # Arguments length warning
         $argsLen = $textArgs.Text.Length
@@ -6565,27 +6715,7 @@ $btnPin.Add_Click({
                     $cplItem = Resolve-CplControlPanelItem $targetPath
                     if ($null -ne $cplItem) {
                         # $displayName : the shortcut location's name, else the Control Panel's name
-                        $pinAumid = Get-ActiveAumid
-                        if (Test-StringEmpty $pinAumid) {
-                            $pinAumid = $cplItem.Path
-                        }
-                        $pinDesc  = Get-ActiveDescription
-                        if (Test-StringEmpty $pinDesc) {
-                            $pinDesc = $cplItem.Name
-                        }
-                        if (-not $radioIcon_TargetDefault.Checked) {
-                            $pinIcoBytes = Get-IcoBytesFromCurrentSource
-                            if ($null -ne $pinIcoBytes -and $pinIcoBytes.Length -gt 0) {
-                                [ShortcutHelper]::CreateShellWithEmbeddedIcon($lnkToPin, $cplItem.Path, ([byte[]]$pinIcoBytes), $pinAumid, $pinDesc)
-                                Write-AdsIcon -FilePath $lnkToPin -IcoBytes ([byte[]]$pinIcoBytes)
-                            }
-                            else {
-                                [ShortcutHelper]::CreateShellWithStandardIcon($lnkToPin, $cplItem.Path, "", 0, $pinAumid, $pinDesc)
-                            }
-                        }
-                        else {
-                            [ShortcutHelper]::CreateShellWithStandardIcon($lnkToPin, $cplItem.Path, "", 0, $pinAumid, $pinDesc)
-                        }
+                        New-CplItemShortcut $lnkToPin $cplItem
                         Write-Log "Pin to Taskbar : .cpl resolved to PIDL shortcut : $lnkToPin -> $($cplItem.Path)"
                     }
                     else {

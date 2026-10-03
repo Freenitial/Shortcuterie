@@ -54,7 +54,7 @@ The entire window is a drop target with zone-based routing:
 
 ### Taskbar Pinning
 
-Click **Pin to Taskbar** to add the shortcut into the taskbar. This works for standard executables and UWP apps. When the shortcut is already pinned, the button reads **Update Pin** and updates the pinned item in place, icon included.
+Click **Pin to Taskbar** to add the shortcut into the taskbar. This works for executables, UWP apps, Control Panel applets, consoles, documents, scripts, folders and URLs. When the shortcut is already pinned, the button reads **Update Pin** and updates the pinned item in place, icon included.
 
 ## Limitations
 
